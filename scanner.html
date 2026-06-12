@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+  <style>
+    :root {
+      --hf-green: #91C14A;
+      --hf-green-dark: #6FA02E;
+      --red: #D9483B;
+      --amber: #E8A33D;
+      --ink: #233323;
+      --bg: #F4F6F0;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+    body { font-family: -apple-system, Roboto, 'Segoe UI', sans-serif; background: var(--bg); color: var(--ink); }
+    .screen { display: none; padding: 16px; max-width: 480px; margin: 0 auto; }
+    .screen.active { display: block; }
+    h1 { font-size: 20px; margin-bottom: 4px; }
+    .sub { color: #6b7a6b; font-size: 14px; margin-bottom: 20px; }
+    .brandbar { background: var(--hf-green); color: #fff; padding: 12px 16px; font-weight: 700; font-size: 16px;
+                display: flex; justify-content: space-between; align-items: center; }
+    .brandbar small { font-weight: 400; opacity: .9; }
+    input[type=text] { width: 100%; padding: 14px; font-size: 18px; border: 2px solid #cdd6c8; border-radius: 10px; margin-bottom: 16px; }
+    .btn { display: block; width: 100%; padding: 16px; font-size: 18px; font-weight: 700; border: none;
+           border-radius: 12px; background: var(--hf-green); color: #fff; cursor: pointer; }
+    .btn:active { background: var(--hf-green-dark); }
+    .btn.secondary { background: #fff; color: var(--ink); border: 2px solid #cdd6c8; }
+    .btn.danger { background: var(--red); }
+    .btn:disabled { opacity: .5; }
+    .route-btn { width: 100%; padding: 16px; margin-bottom: 10px; font-size: 18px; border-radius: 12px;
+                 border: 2px solid #cdd6c8; background: #fff; display: flex; justify-content: space-between; cursor: pointer; }
+    .route-btn b { font-size: 18px; }
+    .route-btn span { color: #6b7a6b; }
+
+    /* Scan screen */
+    #reader { width: 100%; border-radius: 12px; overflow: hidden; background: #000; min-height: 240px; }
+    #flash { position: fixed; inset: 0; pointer-events: none; opacity: 0; transition: opacity .15s; z-index: 50; }
+    #flash.good  { background: var(--hf-green); opacity: .75; }
+    #flash.bad   { background: var(--red); opacity: .8; }
+    #flash.warn  { background: var(--amber); opacity: .75; }
+    #status { text-align: center; padding: 14px; margin: 12px 0; border-radius: 12px; font-size: 18px;
+              font-weight: 700; background: #fff; border: 2px solid #cdd6c8; min-height: 56px; }
+    #status.good { background: var(--hf-green); color: #fff; border-color: var(--hf-green-dark); }
+    #status.bad  { background: var(--red); color: #fff; border-color: #b23226; }
+    #status.warn { background: var(--amber); color: #fff; border-color: #c4862a; }
+    #status small { display: block; font-weight: 400; font-size: 14px; margin-top: 2px; }
+    .progress { display: flex; justify-content: space-between; font-size: 15px; color: #6b7a6b; margin-bottom: 8px; }
+    .manual { display: flex; gap: 8px; margin: 12px 0; }
+    .manual input { flex: 1; margin: 0; }
+    .manual button { width: auto; padding: 0 18px; }
+    .missing-list { background: #fff; border: 2px solid var(--red); border-radius: 12px; padding: 14px; margin: 14px 0; }
+    .missing-list li { margin: 6px 0 6px 18px; font-size: 16px; }
+    .complete-banner { background: var(--hf-green); color: #fff; border-radius: 12px; padding: 18px;
+                       text-align: center; font-size: 20px; font-weight: 800; margin: 14px 0; }
+    .loader { text-align: center; padding: 40px; color: #6b7a6b; }
+    .recent { font-size: 13px; color: #6b7a6b; margin-top: 10px; }
+    .recent div { padding: 3px 0; border-bottom: 1px solid #e3e8de; }
+  </style>
+</head>
+<body>
+  <div class="brandbar">📦 Box Scanner <small id="who"></small></div>
+  <div id="flash"></div>
+
+  <!-- 1: NAME -->
+  <div class="screen active" id="scr-name">
+    <h1>Who's scanning?</h1>
+    <p class="sub">Your name appears in the end-of-night report.</p>
+    <input type="text" id="name-input" placeholder="e.g. Sam" autocomplete="off">
+    <button class="btn" onclick="saveName()">Continue</button>
+  </div>
+
+  <!-- 2: ROUTE PICK -->
+  <div class="screen" id="scr-route">
+    <h1>Select your route</h1>
+    <p class="sub">You must pick a route before scanning.</p>
+    <div id="route-list" class="loader">Loading routes…</div>
+  </div>
+
+  <!-- 3: SCAN -->
+  <div class="screen" id="scr-scan">
+    <div class="progress">
+      <span>Route <b id="route-label"></b></span>
+      <span id="count-label"></span>
+    </div>
+    <div id="reader"></div>
+    <div id="status">Point camera at a box label</div>
+    <div class="manual">
+      <input type="text" id="manual-input" placeholder="Type code if barcode won't scan">
+      <button class="btn secondary" onclick="manualScan()">Check</button>
+    </div>
+    <button class="btn" onclick="confirmRoute()" id="confirm-btn">✅ Confirm all boxes scanned</button>
+    <button class="btn secondary" style="margin-top:10px" onclick="switchRoute()">↩ Switch route</button>
+    <div class="recent" id="recent"></div>
+  </div>
+
+  <!-- 4: CONFIRM RESULT -->
+  <div class="screen" id="scr-result">
+    <h1>Route check</h1>
+    <div id="result-body" class="loader">Checking all phones…</div>
+    <button class="btn" onclick="backToScan()">↩ Keep scanning this route</button>
+    <button class="btn secondary" style="margin-top:10px" onclick="switchRoute()">Pick another route</button>
+  </div>
+
+<script>
+// ════════ CONFIG — EDIT THESE TWO LINES ════════
+var SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbz_n0qUSu3MVxHsJStIUhBY9s7PPA0rP1_l8wWFcl4W57LiXVPb50olGl7mO6ReQoJn/exec';
+var API_KEY    = 'hf-scan-d06c1ea9f124'; // must match Code.gs CONFIG.API_KEY
+// ═══════════════════════════════════════════════
+
+/**
+ * Calls the Apps Script backend. Content-Type is text/plain on purpose:
+ * it avoids a CORS preflight, which Apps Script does not support.
+ */
+function api(action, params) {
+  var body = Object.assign({ key: API_KEY, action: action }, params || {});
+  return fetch(SCRIPT_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+    body: JSON.stringify(body),
+    redirect: 'follow'
+  }).then(function (r) { return r.json(); })
+    .then(function (res) {
+      if (!res.ok) throw new Error(res.error || 'Server error');
+      return res.data;
+    });
+}
+
+var DATA = null;          // {routes, codeToRoute, codeToStop}
+var ROUTE = null;
+var NAME = localStorage.getItem('scannerName') || '';
+var scannedHere = {};     // codes OK-scanned on THIS phone for this route
+var lastCode = '', lastTime = 0;
+var scanner = null;
+
+// ---------- Sounds (Web Audio, no files needed) ----------
+var actx = null;
+function beep(freq, start, dur, type, vol) {
+  var o = actx.createOscillator(), g = actx.createGain();
+  o.type = type || 'sine'; o.frequency.value = freq;
+  g.gain.setValueAtTime(vol || 0.5, actx.currentTime + start);
+  g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + start + dur);
+  o.connect(g); g.connect(actx.destination);
+  o.start(actx.currentTime + start); o.stop(actx.currentTime + start + dur + 0.05);
+}
+function soundGood() {  // grocery-store ding
+  beep(1100, 0, 0.12); beep(1480, 0.09, 0.22);
+  if (navigator.vibrate) navigator.vibrate(80);
+}
+function soundBad() {   // duh-duh
+  beep(220, 0, 0.22, 'square', 0.4); beep(160, 0.26, 0.4, 'square', 0.4);
+  if (navigator.vibrate) navigator.vibrate([150, 80, 250]);
+}
+function soundDup() { beep(700, 0, 0.15, 'triangle', 0.35); }
+
+function ensureAudio() {
+  if (!actx) actx = new (window.AudioContext || window.webkitAudioContext)();
+  if (actx.state === 'suspended') actx.resume();
+}
+
+// ---------- Screens ----------
+function show(id) {
+  document.querySelectorAll('.screen').forEach(function (s) { s.classList.remove('active'); });
+  document.getElementById(id).classList.add('active');
+}
+function flash(cls) {
+  var f = document.getElementById('flash');
+  f.className = cls;
+  setTimeout(function () { f.className = ''; }, 350);
+}
+function setStatus(cls, main, sub) {
+  var s = document.getElementById('status');
+  s.className = cls;
+  s.innerHTML = main + (sub ? '<small>' + sub + '</small>' : '');
+}
+
+// ---------- 1: Name ----------
+if (NAME) document.getElementById('name-input').value = NAME;
+function saveName() {
+  ensureAudio();
+  NAME = document.getElementById('name-input').value.trim();
+  if (!NAME) { alert('Please enter your name'); return; }
+  localStorage.setItem('scannerName', NAME);
+  document.getElementById('who').textContent = NAME;
+  show('scr-route');
+  loadRoutes();
+}
+
+// ---------- 2: Routes ----------
+function loadRoutes() {
+  document.getElementById('route-list').innerHTML = '<div class="loader">Loading routes…</div>';
+  api('getRouteData').then(function (data) {
+    DATA = data;
+    var html = '';
+    data.routes.forEach(function (r) {
+      html += '<button class="route-btn" onclick="pickRoute(\'' + r.id + '\')">' +
+              '<b>Route ' + r.id + '</b><span>' + r.count + ' boxes</span></button>';
+    });
+    document.getElementById('route-list').innerHTML = html || '<p>No routes found in the sheet.</p>';
+  }).catch(function (e) {
+    document.getElementById('route-list').innerHTML =
+      '<p style="color:var(--red)">Error: ' + e.message +
+      '</p><button class="btn secondary" style="margin-top:12px" onclick="loadRoutes()">Retry</button>';
+  });
+}
+
+function pickRoute(id) {
+  ensureAudio();
+  ROUTE = id;
+  scannedHere = {};
+  document.getElementById('route-label').textContent = id;
+  updateCount();
+  document.getElementById('recent').innerHTML = '';
+  setStatus('', 'Point camera at a box label');
+  show('scr-scan');
+  startCamera();
+}
+
+function routeTotal() {
+  var r = DATA.routes.find(function (x) { return x.id === ROUTE; });
+  return r ? r.count : 0;
+}
+function updateCount() {
+  document.getElementById('count-label').textContent =
+    Object.keys(scannedHere).length + ' / ' + routeTotal() + ' on this phone';
+}
+
+// ---------- 3: Camera + validation ----------
+function startCamera() {
+  if (scanner) { scanner.clear().catch(function(){}); }
+  scanner = new Html5Qrcode('reader');
+  scanner.start(
+    { facingMode: 'environment' },
+    { fps: 10, qrbox: { width: 280, height: 160 },
+      formatsToSupport: [
+        Html5QrcodeSupportedFormats.CODE_128,
+        Html5QrcodeSupportedFormats.CODE_39,
+        Html5QrcodeSupportedFormats.EAN_13,
+        Html5QrcodeSupportedFormats.QR_CODE
+      ] },
+    onScan,
+    function () {} // ignore per-frame decode misses
+  ).catch(function (err) {
+    setStatus('bad', 'Camera unavailable', 'Allow camera access in Chrome, or use manual entry below. ' + err);
+  });
+}
+
+function onScan(text) {
+  var code = String(text).trim().toUpperCase();
+  var now = Date.now();
+  if (code === lastCode && now - lastTime < 2500) return; // debounce duplicate frames
+  lastCode = code; lastTime = now;
+  handleCode(code);
+}
+
+function manualScan() {
+  ensureAudio();
+  var el = document.getElementById('manual-input');
+  var code = el.value.trim().toUpperCase();
+  if (!code) return;
+  el.value = '';
+  handleCode(code);
+}
+
+function handleCode(code) {
+  var expectedRoute = DATA.codeToRoute[code];
+  var status, sub = '';
+
+  if (!expectedRoute) {
+    status = 'NOT_FOUND';
+    soundBad(); flash('bad');
+    setStatus('bad', '❌ ' + code, 'Not found in today\'s file — set aside');
+  } else if (expectedRoute !== ROUTE) {
+    status = 'WRONG_ROUTE';
+    soundBad(); flash('bad');
+    setStatus('bad', '🚫 WRONG VAN — ' + code, 'Belongs to Route ' + expectedRoute);
+  } else if (scannedHere[code]) {
+    status = 'DUPLICATE';
+    soundDup(); flash('warn');
+    setStatus('warn', '↩ Already scanned', code);
+  } else {
+    status = 'OK';
+    scannedHere[code] = true;
+    soundGood(); flash('good');
+    var stop = DATA.codeToStop[code] || '';
+    setStatus('good', '✅ ' + code, stop ? stop : 'Correct van');
+    updateCount();
+  }
+
+  addRecent(code, status);
+  queueScan({ scanner: NAME, route: ROUTE, code: code, status: status, expectedRoute: expectedRoute || '' });
+}
+
+// ---------- Scan upload with retry (handles brief signal drops) ----------
+var pendingScans = JSON.parse(localStorage.getItem('pendingScans') || '[]');
+var uploading = false;
+function queueScan(scan) {
+  pendingScans.push(scan);
+  localStorage.setItem('pendingScans', JSON.stringify(pendingScans));
+  uploadNext();
+}
+function uploadNext() {
+  if (uploading || pendingScans.length === 0) return;
+  uploading = true;
+  api('logScan', { scan: pendingScans[0] }).then(function () {
+    pendingScans.shift();
+    localStorage.setItem('pendingScans', JSON.stringify(pendingScans));
+    uploading = false;
+    uploadNext();
+  }).catch(function () {
+    uploading = false;
+    setTimeout(uploadNext, 4000); // retry until signal returns
+  });
+}
+uploadNext(); // flush anything left over from a previous session
+
+function addRecent(code, status) {
+  var icon = { OK: '✅', WRONG_ROUTE: '🚫', NOT_FOUND: '❌', DUPLICATE: '↩' }[status];
+  var box = document.getElementById('recent');
+  box.insertAdjacentHTML('afterbegin', '<div>' + icon + ' ' + code + '</div>');
+  while (box.children.length > 6) box.removeChild(box.lastChild);
+}
+
+// ---------- 4: Confirm route ----------
+function confirmRoute() {
+  if (pendingScans.length > 0) {
+    alert(pendingScans.length + ' scan(s) still uploading — wait a few seconds and try again.');
+    uploadNext();
+    return;
+  }
+  show('scr-result');
+  document.getElementById('result-body').innerHTML = '<div class="loader">Checking scans from all phones…</div>';
+  api('confirmRoute', { route: ROUTE, scanner: NAME }).then(function (res) {
+    var html;
+    if (res.missing.length === 0) {
+      soundGood();
+      html = '<div class="complete-banner">🎉 Route ' + res.route + ' complete!<br>' +
+             res.scannedCount + '/' + res.total + ' boxes scanned</div>';
+    } else {
+      soundBad();
+      html = '<div class="missing-list"><b style="color:var(--red)">⚠️ ' + res.missing.length +
+             ' box(es) missing on Route ' + res.route + ' (' + res.scannedCount + '/' + res.total + ' scanned):</b><ul>';
+      res.missing.forEach(function (m) {
+        html += '<li><b>' + m.code + '</b>' + (m.stop ? ' — ' + m.stop : '') + '</li>';
+      });
+      html += '</ul></div>';
+    }
+    document.getElementById('result-body').innerHTML = html;
+  }).catch(function (e) {
+    document.getElementById('result-body').innerHTML = '<p style="color:var(--red)">Error: ' + e.message + '</p>';
+  });
+}
+
+function backToScan() { show('scr-scan'); }
+function switchRoute() {
+  if (scanner) { scanner.stop().catch(function(){}); scanner = null; }
+  show('scr-route');
+  loadRoutes(); // refresh in case sheet changed
+}
+
+if (NAME) document.getElementById('who').textContent = NAME;
+</script>
+</body>
+</html>
