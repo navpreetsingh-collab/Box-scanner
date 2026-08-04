@@ -1,786 +1,620 @@
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
-  <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
-  <style>
-    :root {
-      --hf-green: #91C14A;
-      --hf-green-dark: #6FA02E;
-      --red: #D9483B;
-      --amber: #E8A33D;
-      --ink: #233323;
-      --bg: #F4F6F0;
+/**
+ * HELLOFRESH BOX SCANNER — Backend API (Google Apps Script)
+ * ----------------------------------------------------------
+ * Lives inside the route spreadsheet. The scanner web page is hosted
+ * separately (e.g. GitHub Pages) and calls this script as an API.
+ * This script reads routes, logs scans from all phones into one tab,
+ * and posts a compiled end-of-night report to Slack.
+ *
+ * LiveStatus board:
+ *   A per-box status board rebuilt from the route file at start of night.
+ *   Column D holds '' | 'SCANNED' | 'MISSING'. It is a PROJECTION of ScanLog
+ *   (ScanLog stays the source of truth), so a phone that dies mid-route can be
+ *   replaced by any other phone, which reads back what's already SCANNED.
+ *
+ * "Start Fresh Night" button (sheet menu):
+ *   One click after pasting a new route export: rebuilds LiveStatus (resets the
+ *   status column to empty), wipes yesterday's ScanLog, and bumps a version
+ *   stamp so every phone throws away its cached routes and re-fetches.
+ */
+
+// ════════════════ CONFIG — EDIT THESE ════════════════
+var CONFIG = {
+  ROUTE_SHEET_NAME: 'Sheet1',     // Tab name that holds the daily route export
+  ROUTE_COL: 1,                   // Column A = routeId
+  CODE_COL: 22,                   // Column V = box code (printed as barcode)
+  STOP_NAME_COL: 19,              // Column S = locationName (customer) — shown in missing report
+  SCAN_LOG_SHEET: 'ScanLog',      // Auto-created. Do not edit by hand.
+  FOUND_SHEET: 'FoundBoxes',      // Auto-created. Out-of-route / set-aside boxes + where they are.
+  LIVE_SHEET: 'LiveStatus',       // Auto-created/rebuilt. Live per-box status board.
+  API_KEY: 'hf-scan-d06c1ea9f124',  // Must match API_KEY in scanner.html
+  SLACK_WEBHOOK_URL: 'PASTE_YOUR_SLACK_INCOMING_WEBHOOK_URL_HERE',
+  REPORT_HOUR: 22,                // 24h clock, script timezone. 22 = 10pm. Nightly auto-report.
+  REPORT_TITLE: 'Nightly Box Scan Report'
+};
+// ═════════════════════════════════════════════════════
+
+// ---------- Data version (for phone cache invalidation) ----------
+// Stored in Script Properties. Bumped by "Start Fresh Night". Phones compare
+// their cached version to this; a mismatch forces a fresh route download.
+function getDataVersion_() {
+  var v = PropertiesService.getScriptProperties().getProperty('DATA_VERSION');
+  return v || '0';
+}
+function bumpDataVersion_() {
+  var v = String(Date.now()); // monotonic, unique per click
+  PropertiesService.getScriptProperties().setProperty('DATA_VERSION', v);
+  return v;
+}
+
+// ---------- API entry points ----------
+// The scanner page sends POST requests with a JSON body:
+//   { key: API_KEY, action: 'getRouteData' | 'logScan' | 'confirmRoute'
+//                          | 'getRouteProgress' | 'getVersion'
+//                          | 'logFound' | 'getFoundList' | 'resolveFound', ...params }
+function doPost(e) {
+  var req;
+  try { req = JSON.parse(e.postData.contents); }
+  catch (err) { return json_({ ok: false, error: 'Bad request' }); }
+
+  if (req.key !== CONFIG.API_KEY) return json_({ ok: false, error: 'Invalid key' });
+
+  try {
+    switch (req.action) {
+      case 'getVersion':
+        return json_({ ok: true, data: { version: getDataVersion_() } });
+      case 'getRouteData':
+        return json_({ ok: true, data: getRouteData() });
+      case 'logScan':
+        logScan(req.scan || {});
+        return json_({ ok: true });
+      case 'getRouteProgress':
+        return json_({ ok: true, data: getRouteProgress_(req.route) });
+      case 'confirmRoute':
+        return json_({ ok: true, data: confirmRoute(req.route, req.scanner) });
+      case 'logFound':
+        return json_({ ok: true, data: logFound_(req) });
+      case 'getFoundList':
+        return json_({ ok: true, data: getFoundList_(req) });
+      case 'resolveFound':
+        return json_({ ok: true, data: resolveFound_(req) });
+      default:
+        return json_({ ok: false, error: 'Unknown action' });
     }
-    * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
-    body { font-family: -apple-system, Roboto, 'Segoe UI', sans-serif; background: var(--bg); color: var(--ink); }
-    .screen { display: none; padding: 16px; max-width: 480px; margin: 0 auto; }
-    .screen.active { display: block; }
-    h1 { font-size: 20px; margin-bottom: 4px; }
-    .sub { color: #6b7a6b; font-size: 14px; margin-bottom: 20px; }
-    .brandbar { background: var(--hf-green); color: #fff; padding: 12px 16px; font-weight: 700; font-size: 16px;
-                display: flex; justify-content: space-between; align-items: center; }
-    .brandbar small { font-weight: 400; opacity: .9; }
-    input[type=text] { width: 100%; padding: 14px; font-size: 18px; border: 2px solid #cdd6c8; border-radius: 10px; margin-bottom: 16px; }
-    .btn { display: block; width: 100%; padding: 16px; font-size: 18px; font-weight: 700; border: none;
-           border-radius: 12px; background: var(--hf-green); color: #fff; cursor: pointer; }
-    .btn:active { background: var(--hf-green-dark); }
-    .btn.secondary { background: #fff; color: var(--ink); border: 2px solid #cdd6c8; }
-    .btn.danger { background: var(--red); }
-    .btn:disabled { opacity: .5; }
-    .route-btn { width: 100%; padding: 16px; margin-bottom: 10px; font-size: 18px; border-radius: 12px;
-                 border: 2px solid #cdd6c8; background: #fff; display: flex; justify-content: space-between; align-items:center; cursor: pointer; text-align:left; }
-    .route-btn b { font-size: 18px; }
-    .route-btn span { color: #6b7a6b; }
+  } catch (err) {
+    return json_({ ok: false, error: String(err.message || err) });
+  }
+}
 
-    /* Scan screen */
-    #reader { width: 100%; border-radius: 12px; overflow: hidden; background: #000; min-height: 240px; }
-    #flash { position: fixed; inset: 0; pointer-events: none; opacity: 0; transition: opacity .15s; z-index: 50; }
-    #flash.good  { background: var(--hf-green); opacity: .75; }
-    #flash.bad   { background: var(--red); opacity: .8; }
-    #flash.warn  { background: var(--amber); opacity: .75; }
-    #status { text-align: center; padding: 14px; margin: 12px 0; border-radius: 12px; font-size: 18px;
-              font-weight: 700; background: #fff; border: 2px solid #cdd6c8; min-height: 56px; }
-    #status.good { background: var(--hf-green); color: #fff; border-color: var(--hf-green-dark); }
-    #status.bad  { background: var(--red); color: #fff; border-color: #b23226; }
-    #status.warn { background: var(--amber); color: #fff; border-color: #c4862a; }
-    #status small { display: block; font-weight: 400; font-size: 14px; margin-top: 2px; }
-    .progress { display: flex; justify-content: space-between; font-size: 15px; color: #6b7a6b; margin-bottom: 8px; }
-    .manual { display: flex; gap: 8px; margin: 12px 0; }
-    .manual input { flex: 1; margin: 0; }
-    .manual button { width: auto; padding: 0 18px; }
-    .missing-list { background: #fff; border: 2px solid var(--red); border-radius: 12px; padding: 14px; margin: 14px 0; }
-    .missing-list li { margin: 8px 0 8px 18px; font-size: 16px; list-style: none; }
-    .missing-list li .hint { display:block; font-size:13px; color:#8a6d1f; font-weight:600; margin-top:2px; }
-    .complete-banner { background: var(--hf-green); color: #fff; border-radius: 12px; padding: 18px;
-                       text-align: center; font-size: 20px; font-weight: 800; margin: 14px 0; }
-    .loader { text-align: center; padding: 40px; color: #6b7a6b; }
-    .recent { font-size: 13px; color: #6b7a6b; margin-top: 10px; }
-    .recent div { padding: 3px 0; border-bottom: 1px solid #e3e8de; }
+// Simple health check if someone opens the URL in a browser
+function doGet() {
+  return json_({ ok: true, service: 'box-scanner-api' });
+}
 
-    /* Decision modal (wrong route / not found) */
-    .decision-panel { position: fixed; inset: 0; background: rgba(0,0,0,.55); display: none;
-                      align-items: center; justify-content: center; padding: 20px; z-index: 100; }
-    .decision-card { background: #fff; border-radius: 16px; padding: 20px; max-width: 420px; width: 100%;
-                     box-shadow: 0 12px 40px rgba(0,0,0,.3); }
-    #decision-title { font-size: 22px; font-weight: 800; margin-bottom: 4px; word-break: break-all; }
-    .decision-sub { color: #6b7a6b; font-size: 15px; margin-bottom: 16px; }
+function json_(obj) {
+  return ContentService.createTextOutput(JSON.stringify(obj))
+    .setMimeType(ContentService.MimeType.JSON);
+}
 
-    /* Found list (missing-boxes mode) */
-    .found-card { background: #fff; border: 2px solid #cdd6c8; border-radius: 12px; padding: 12px 14px; margin-bottom: 10px; }
-    .found-card.resolved { opacity: .55; border-style: dashed; }
-    .found-card .fc-code { font-size: 18px; font-weight: 800; word-break: break-all; }
-    .found-card .fc-meta { font-size: 14px; color: #6b7a6b; margin: 3px 0; }
-    .found-card .fc-loc { font-size: 15px; font-weight: 700; color: var(--ink); }
-    .found-card .btn { margin-top: 8px; padding: 10px; font-size: 15px; }
-    .badge { display: inline-block; background: var(--amber); color: #fff; font-size: 12px; font-weight: 700;
-             padding: 2px 8px; border-radius: 20px; margin-left: 6px; }
-    .badge.done { background: var(--hf-green-dark); }
-    .empty { text-align:center; color:#6b7a6b; padding:30px 10px; }
-  </style>
-</head>
-<body>
-  <div class="brandbar">📦 Box Scanner <small id="who"></small></div>
-  <div id="flash"></div>
+// ---------- Route data ----------
+/**
+ * Returns { version, routes: [{id, count}], codeToRoute: {CODE: routeId}, codeToStop: {CODE: name} }
+ * Codes are uppercased + trimmed. Rows with no code (e.g. DEPOT rows) are skipped.
+ * The version lets the phone detect a "fresh night" bump on the same call it
+ * uses to load routes, not just via a separate getVersion poll.
+ */
+function getRouteData() {
+  var sheet = SpreadsheetApp.getActive().getSheetByName(CONFIG.ROUTE_SHEET_NAME);
+  if (!sheet) throw new Error('Route tab "' + CONFIG.ROUTE_SHEET_NAME + '" not found. Check CONFIG.ROUTE_SHEET_NAME.');
 
-  <!-- 1: NAME -->
-  <div class="screen active" id="scr-name">
-    <h1>Who's scanning?</h1>
-    <p class="sub">Your name appears in the end-of-night report.</p>
-    <input type="text" id="name-input" placeholder="e.g. Sam" autocomplete="off">
-    <button class="btn" onclick="saveName()">Continue</button>
-  </div>
+  var values = sheet.getDataRange().getValues();
+  var codeToRoute = {};
+  var codeToStop = {};
+  var routeCounts = {};
 
-  <!-- 2: MODE PICK  (Feature 4) -->
-  <div class="screen" id="scr-mode">
-    <h1>What are you doing tonight?</h1>
-    <p class="sub">Pick how you want to use the scanner.</p>
-    <button class="route-btn" onclick="startNormal()">
-      <b>📦 Normal scan</b><span>Load a route</span></button>
-    <button class="route-btn" onclick="startMissing()">
-      <b>🔎 Find missing boxes</b><span>See the Found list</span></button>
-    <button class="btn secondary" style="margin-top:10px" onclick="changeName()">Change name</button>
-  </div>
+  for (var i = 1; i < values.length; i++) { // skip header
+    var code = String(values[i][CONFIG.CODE_COL - 1] || '').trim().toUpperCase();
+    if (!code) continue;
+    var route = String(values[i][CONFIG.ROUTE_COL - 1]).trim();
+    if (route === '') continue;
+    codeToRoute[code] = route;
+    codeToStop[code] = String(values[i][CONFIG.STOP_NAME_COL - 1] || '').trim();
+    routeCounts[route] = (routeCounts[route] || 0) + 1;
+  }
 
-  <!-- 3: ROUTE PICK -->
-  <div class="screen" id="scr-route">
-    <h1>Select your route</h1>
-    <p class="sub">You must pick a route before scanning.</p>
-    <div id="route-list" class="loader">Loading routes…</div>
-    <button class="btn secondary" style="margin-top:10px" onclick="show('scr-mode')">↩ Back</button>
-  </div>
+  var routes = Object.keys(routeCounts)
+    .sort(function (a, b) { return (Number(a) || 0) - (Number(b) || 0) || a.localeCompare(b); })
+    .map(function (r) { return { id: r, count: routeCounts[r] }; });
 
-  <!-- 4: SCAN -->
-  <div class="screen" id="scr-scan">
-    <div class="progress">
-      <span>Route <b id="route-label"></b></span>
-      <span id="count-label"></span>
-    </div>
-    <div id="reader"></div>
-    <div id="status">Point camera at a box label</div>
-    <div class="manual">
-      <input type="text" id="manual-input" placeholder="Type code if barcode won't scan">
-      <button class="btn secondary" onclick="manualScan()">Check</button>
-    </div>
-    <button class="btn" onclick="confirmRoute()" id="confirm-btn">✅ Done scanning this route</button>
-    <button class="btn secondary" style="margin-top:10px" onclick="switchRoute()">↩ Switch route</button>
-    <div class="recent" id="recent"></div>
-  </div>
+  return { version: getDataVersion_(), routes: routes, codeToRoute: codeToRoute, codeToStop: codeToStop };
+}
 
-  <!-- 5: CONFIRM RESULT -->
-  <div class="screen" id="scr-result">
-    <h1>Route check</h1>
-    <div id="result-body" class="loader">Checking all phones…</div>
-    <button class="btn" onclick="backToScan()">↩ Keep scanning this route</button>
-    <button class="btn secondary" style="margin-top:10px" onclick="switchRoute()">Pick another route</button>
-  </div>
-
-  <!-- 6: FOUND LIST (missing-boxes mode) -->
-  <div class="screen" id="scr-found">
-    <h1>Found boxes</h1>
-    <p class="sub">Boxes set aside on the wrong lane — go collect them.</p>
-    <div class="manual">
-      <input type="text" id="found-search" placeholder="Filter by code or route" oninput="renderFound()">
-      <button class="btn secondary" onclick="loadFound()">↻</button>
-    </div>
-    <div id="found-body" class="loader">Loading…</div>
-    <button class="btn secondary" style="margin-top:12px" onclick="show('scr-mode')">↩ Back</button>
-  </div>
-
-  <!-- Decision modal -->
-  <div class="decision-panel" id="decision">
-    <div class="decision-card">
-      <div id="decision-title"></div>
-      <div id="decision-sub" class="decision-sub"></div>
-      <div id="decision-actions"></div>
-      <div id="found-loc" style="display:none">
-        <input type="text" id="loc-input" placeholder="Where is it? e.g. Lane 12 / overflow rack">
-        <button class="btn" onclick="saveFound()">📍 Save to Found list</button>
-        <button class="btn secondary" style="margin-top:8px" onclick="closeDecision()">Cancel</button>
-      </div>
-    </div>
-  </div>
-
-<script>
-// ════════ CONFIG — EDIT THESE TWO LINES ════════
-var SCRIPT_URL = 'https://script.google.com/macros/s/AKfycby3j9ffQDCK3llksDDZI2FmEA7iaGcdfv1h8TTG9-bTO99RxX5GTwm_OLi-od5kMO6U/exec';
-var API_KEY    = 'hf-scan-d06c1ea9f124'; // must match Code.gs CONFIG.API_KEY
-// ═══════════════════════════════════════════════
+// ---------- LiveStatus board (per-box status projection) ----------
+/**
+ * Finds (or creates) the LiveStatus tab. Header only if freshly created.
+ * Layout: A=Route  B=Code  C=Stop  D=Status ('' | SCANNED | MISSING)
+ *         E=Scanner (who scanned it)  F=UpdatedAt
+ */
+function liveSheet_() {
+  var ss = SpreadsheetApp.getActive();
+  var sheet = ss.getSheetByName(CONFIG.LIVE_SHEET);
+  if (!sheet) {
+    sheet = ss.insertSheet(CONFIG.LIVE_SHEET);
+    sheet.appendRow(['Route', 'Code', 'Stop', 'Status', 'Scanner', 'UpdatedAt']);
+    sheet.setFrozenRows(1);
+  }
+  return sheet;
+}
 
 /**
- * Calls the Apps Script backend. Content-Type is text/plain on purpose:
- * it avoids a CORS preflight, which Apps Script does not support.
+ * Rebuilds the LiveStatus board from the current route file, wiping all
+ * statuses back to empty. This regenerates the status column from the new
+ * sheet. Called by "Start Fresh Night". This is the only thing that clears status.
  */
-function api(action, params) {
-  var body = Object.assign({ key: API_KEY, action: action }, params || {});
-  return fetch(SCRIPT_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-    body: JSON.stringify(body),
-    redirect: 'follow'
-  }).then(function (r) { return r.json(); })
-    .then(function (res) {
-      if (!res.ok) throw new Error(res.error || 'Server error');
-      return res.data;
+function rebuildLiveStatus_() {
+  var data = getRouteData();
+  var sheet = liveSheet_();
+  // Clear everything below the header.
+  if (sheet.getLastRow() > 1) sheet.deleteRows(2, sheet.getLastRow() - 1);
+
+  // One row per box, ordered by route then code so the board reads naturally.
+  var rows = [];
+  Object.keys(data.codeToRoute)
+    .sort(function (a, b) {
+      var ra = data.codeToRoute[a], rb = data.codeToRoute[b];
+      var na = Number(ra) || 0, nb = Number(rb) || 0;
+      if (na !== nb) return na - nb;
+      if (ra !== rb) return ra.localeCompare(rb);
+      return a.localeCompare(b);
+    })
+    .forEach(function (code) {
+      rows.push([data.codeToRoute[code], code, data.codeToStop[code] || '', '', '', '']);
     });
+
+  if (rows.length) sheet.getRange(2, 1, rows.length, 6).setValues(rows);
+  return rows.length;
 }
 
-var DATA = null;          // {routes, codeToRoute, codeToStop}
-var ROUTE = null;
-var NAME = localStorage.getItem('scannerName') || '';
-var MODE = null;          // 'normal' | 'missing' — persisted so refresh restores context
-var scannedHere = {};     // codes OK-scanned on THIS phone for this route
-var lastCode = '', lastTime = 0;
-var scanner = null;
-var paused = false;       // true while the decision modal is open
-var pending = null;       // {kind, code, belongsToRoute} for the open decision
-var FOUND = [];           // cache for missing-boxes mode
-
-// ---------- Persistence: survive a page refresh / accidental close ----------
-// Which screen the user is on, plus route+mode, so a reload lands them back.
-function saveSession() {
-  try {
-    localStorage.setItem('session', JSON.stringify({
-      screen: (document.querySelector('.screen.active') || {}).id || 'scr-name',
-      route: ROUTE, mode: MODE
-    }));
-  } catch (e) {}
-}
-// Per-route, per-phone scan progress. Keyed by route so switching routes is safe.
-function progressKey(route) { return 'progress:' + (route || ROUTE); }
-function saveProgress() {
-  if (!ROUTE) return;
-  try { localStorage.setItem(progressKey(ROUTE), JSON.stringify(scannedHere)); } catch (e) {}
-}
-function loadProgress(route) {
-  try { return JSON.parse(localStorage.getItem(progressKey(route)) || '{}'); } catch (e) { return {}; }
-}
-function clearProgress(route) { localStorage.removeItem(progressKey(route)); }
-function progressCount(route) { return Object.keys(loadProgress(route)).length; }
-
-// ---------- Route-data cache (makes the route list appear instantly) ----------
-var ROUTE_CACHE_TTL = 5 * 60 * 1000; // 5 min — long enough for a shift, short enough to catch sheet edits
-function cacheRouteData(data) {
-  try { localStorage.setItem('routeData', JSON.stringify({ t: Date.now(), data: data })); } catch (e) {}
-}
-function readRouteCache() {
-  try {
-    var c = JSON.parse(localStorage.getItem('routeData') || 'null');
-    if (!c || !c.data) return null;
-    return { fresh: (Date.now() - c.t) < ROUTE_CACHE_TTL, data: c.data };
-  } catch (e) { return null; }
-}
-
-// ---------- Sounds (Web Audio, no files needed) ----------
-var actx = null;
-function beep(freq, start, dur, type, vol) {
-  var o = actx.createOscillator(), g = actx.createGain();
-  o.type = type || 'sine'; o.frequency.value = freq;
-  g.gain.setValueAtTime(vol || 0.5, actx.currentTime + start);
-  g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + start + dur);
-  o.connect(g); g.connect(actx.destination);
-  o.start(actx.currentTime + start); o.stop(actx.currentTime + start + dur + 0.05);
-}
-function soundGood() {  // grocery-store ding
-  beep(1100, 0, 0.12); beep(1480, 0.09, 0.22);
-  if (navigator.vibrate) navigator.vibrate(80);
-}
-function soundBad() {   // duh-duh
-  beep(220, 0, 0.22, 'square', 0.4); beep(160, 0.26, 0.4, 'square', 0.4);
-  if (navigator.vibrate) navigator.vibrate([150, 80, 250]);
-}
-function soundDup() { beep(700, 0, 0.15, 'triangle', 0.35); }
-
-function ensureAudio() {
-  if (!actx) actx = new (window.AudioContext || window.webkitAudioContext)();
-  if (actx.state === 'suspended') actx.resume();
-}
-
-// ---------- Screens ----------
-function show(id) {
-  document.querySelectorAll('.screen').forEach(function (s) { s.classList.remove('active'); });
-  document.getElementById(id).classList.add('active');
-  saveSession();
-}
-function flash(cls) {
-  var f = document.getElementById('flash');
-  f.className = cls;
-  setTimeout(function () { f.className = ''; }, 350);
-}
-function setStatus(cls, main, sub) {
-  var s = document.getElementById('status');
-  s.className = cls;
-  s.innerHTML = main + (sub ? '<small>' + sub + '</small>' : '');
-}
-
-// ---------- 1: Name ----------
-if (NAME) document.getElementById('name-input').value = NAME;
-function saveName() {
-  ensureAudio();
-  NAME = document.getElementById('name-input').value.trim();
-  if (!NAME) { alert('Please enter your name'); return; }
-  localStorage.setItem('scannerName', NAME);
-  document.getElementById('who').textContent = NAME;
-  show('scr-mode');
-}
-function changeName() { show('scr-name'); }
-
-// ---------- 2: Mode pick (Features 4/5/6) ----------
-function startNormal() {
-  ensureAudio();
-  MODE = 'normal';
-  show('scr-route');
-  loadRoutes();
-}
-function startMissing() {
-  ensureAudio();
-  MODE = 'missing';
-  if (scanner) { scanner.stop().catch(function(){}); scanner = null; }
-  show('scr-found');
-  loadFound();
-}
-
-// ---------- 3: Routes ----------
-function renderRouteList(data) {
-  DATA = data;
-  // Build once as a single string (fast), rely on delegated click handler below —
-  // no per-row inline onclick, which parses faster for long lists.
-  var parts = [];
-  data.routes.forEach(function (r) {
-    var done = progressCount(r.id);
-    var tag = done > 0
-      ? '<span>' + done + '/' + r.count + ' loaded</span>'
-      : '<span>' + r.count + ' boxes</span>';
-    parts.push('<button class="route-btn" data-route="' + r.id + '">' +
-               '<b>Route ' + r.id + '</b>' + tag + '</button>');
-  });
-  document.getElementById('route-list').innerHTML =
-    parts.join('') || '<p>No routes found in the sheet.</p>';
-}
-
-function loadRoutes() {
-  var el = document.getElementById('route-list');
-  var cache = readRouteCache();
-
-  // 1) Instant paint from cache if we have anything at all.
-  if (cache) {
-    renderRouteList(cache.data);
-    if (cache.fresh) return; // fresh enough — skip the network round-trip entirely
-  } else {
-    el.innerHTML = '<div class="loader">Loading routes…</div>';
+/**
+ * Reads the LiveStatus board into { map: {ROUTE|CODE: idx}, values: [...] }.
+ */
+function liveIndex_(sheet) {
+  var out = { map: {}, values: [] };
+  if (sheet.getLastRow() < 2) return out;
+  var values = sheet.getRange(2, 1, sheet.getLastRow() - 1, 6).getValues();
+  out.values = values;
+  for (var i = 0; i < values.length; i++) {
+    var key = String(values[i][0]).trim() + '|' + String(values[i][1]).trim().toUpperCase();
+    out.map[key] = i; // 0-based index into values (row = i + 2)
   }
+  return out;
+}
 
-  // 2) Refresh in the background (or foreground if there was no cache).
-  api('getRouteData').then(function (data) {
-    cacheRouteData(data);
-    // Only repaint if the route screen is still showing, to avoid clobbering.
-    if (document.getElementById('scr-route').classList.contains('active')) renderRouteList(data);
-    else DATA = data;
-  }).catch(function (e) {
-    if (!cache) {
-      el.innerHTML = '<p style="color:var(--red)">Error: ' + e.message +
-        '</p><button class="btn secondary" style="margin-top:12px" onclick="loadRoutes()">Retry</button>';
+/**
+ * Stamp a single box as SCANNED on the board. Called from logScan for OK scans.
+ * Writes against the box's route (col A) so "moved to correct lane" lands on the
+ * correct route row. No-op if the board hasn't been built or the row is absent.
+ */
+function markLiveScanned_(route, code, scanner) {
+  route = String(route).trim();
+  code = String(code).trim().toUpperCase();
+  if (!route || !code) return;
+  var sheet = SpreadsheetApp.getActive().getSheetByName(CONFIG.LIVE_SHEET);
+  if (!sheet || sheet.getLastRow() < 2) return; // board not built — resume falls back to ScanLog
+  var idx = liveIndex_(sheet);
+  var i = idx.map[route + '|' + code];
+  if (i === undefined) return;                    // this code isn't on this route's board
+  if (String(idx.values[i][3]).toUpperCase() === 'SCANNED') return; // already done
+  var row = i + 2;
+  sheet.getRange(row, 4, 1, 3).setValues([['SCANNED', String(scanner || ''), new Date()]]);
+}
+
+/**
+ * At route confirmation, stamp every still-empty row for that route as MISSING.
+ * Leaves SCANNED rows untouched. Returns count marked missing.
+ */
+function markLiveMissingForRoute_(route) {
+  route = String(route).trim();
+  var sheet = SpreadsheetApp.getActive().getSheetByName(CONFIG.LIVE_SHEET);
+  if (!sheet || sheet.getLastRow() < 2) return 0;
+  var idx = liveIndex_(sheet);
+  var values = idx.values;
+  var changed = 0;
+  for (var i = 0; i < values.length; i++) {
+    if (String(values[i][0]).trim() !== route) continue;
+    var status = String(values[i][3]).toUpperCase();
+    if (status === '') {
+      values[i][3] = 'MISSING';
+      values[i][5] = new Date();
+      changed++;
     }
-    // If we had cache, silently keep showing it.
-  });
-}
-
-// Delegated click handler for the route buttons (one listener, not N).
-document.getElementById('route-list').addEventListener('click', function (ev) {
-  var btn = ev.target.closest('.route-btn');
-  if (btn && btn.dataset.route) pickRoute(btn.dataset.route);
-});
-
-function pickRoute(id) {
-  ensureAudio();
-  // Ask the SERVER what's already scanned for this route (survives a dead phone,
-  // and covers boxes scanned on other phones). Fall back to local if offline.
-  setStatus('', 'Checking route progress…');
-  var localMap = loadProgress(id);
-  api('getRouteProgress', { route: id }).then(function (res) {
-    var serverMap = {};
-    (res.scanned || []).forEach(function (c) { serverMap[String(c).trim().toUpperCase()] = true; });
-    // Merge: anything scanned on the server OR locally counts as done.
-    var merged = Object.assign({}, localMap, serverMap);
-    decideResume(id, merged);
-  }).catch(function () {
-    // Offline / server hiccup — use whatever this phone has locally.
-    decideResume(id, localMap);
-  });
-}
-
-// Given a merged progress map, either enter directly or prompt to resume.
-function decideResume(id, merged) {
-  var count = Object.keys(merged).length;
-  if (count > 0) {
-    // Stash the merged map so resumeRoute can seed from it (not just local).
-    pendingResume = { id: id, map: merged };
-    openResume(id, count);
-  } else {
-    enterRoute(id, {});
   }
-}
-var pendingResume = null;
-
-// Actually enter the scan screen with a given starting progress map.
-function enterRoute(id, progress) {
-  ROUTE = id;
-  scannedHere = progress || {};
-  saveProgress();
-  document.getElementById('route-label').textContent = id;
-  updateCount();
-  document.getElementById('recent').innerHTML = '';
-  var n = Object.keys(scannedHere).length;
-  setStatus(n ? 'good' : '', n ? '▶️ Resumed — ' + n + ' already loaded' : 'Point camera at a box label',
-            n ? 'Keep scanning the rest' : '');
-  show('scr-scan');
-  startCamera();
+  if (changed) sheet.getRange(2, 1, values.length, 6).setValues(values);
+  return changed;
 }
 
-// ----- Resume vs. start-over prompt (reuses the decision modal chrome) -----
-function openResume(id, count) {
-  paused = true;
-  var total = 0;
-  if (DATA) { var r = DATA.routes.find(function (x) { return x.id === id; }); total = r ? r.count : 0; }
-  document.getElementById('found-loc').style.display = 'none';
-  var actions = document.getElementById('decision-actions');
-  actions.style.display = 'block';
-  document.getElementById('decision-title').innerHTML = '▶️ Route ' + id;
-  document.getElementById('decision-sub').innerHTML =
-    '<b>' + count + '</b> box' + (count === 1 ? '' : 'es') + ' already loaded' +
-    (total ? ' (of ' + total + ')' : '') + ' for this route.<br>Do you want to continue where it was left off?';
-  actions.innerHTML =
-    '<button class="btn" onclick="resumeRoute(\'' + jsEsc(id) + '\')">✅ Continue — keep the ' + count + ' scanned</button>' +
-    '<button class="btn danger" style="margin-top:8px" onclick="promptRestart(\'' + jsEsc(id) + '\',' + count + ')">🗑 Start over from zero</button>';
-  document.getElementById('decision').style.display = 'flex';
-}
+/**
+ * action: 'getRouteProgress' — returns codes already SCANNED for this route so
+ * ANY phone can resume, even a fresh one replacing a dead phone.
+ * Prefers the LiveStatus board; falls back to ScanLog if the board isn't built.
+ */
+function getRouteProgress_(route) {
+  route = String(route || '').trim();
+  if (!route) return { route: route, scanned: [] };
 
-function resumeRoute(id) {
-  document.getElementById('decision').style.display = 'none';
-  paused = false;
-  // Prefer the merged (server+local) map captured at prompt time.
-  var map = (pendingResume && pendingResume.id === id) ? pendingResume.map : loadProgress(id);
-  pendingResume = null;
-  enterRoute(id, map);
-}
-
-// Second confirmation with an explicit warning before destroying progress.
-function promptRestart(id, count) {
-  var actions = document.getElementById('decision-actions');
-  document.getElementById('decision-title').innerHTML = '⚠️ Start over?';
-  document.getElementById('decision-sub').innerHTML =
-    'This clears the <b>' + count + ' box' + (count === 1 ? '' : 'es') +
-    '</b> already scanned for Route ' + id + ' on this phone. The night\'s master log and the ' +
-    'Live Status board are not erased — but this phone will show zero and re-scans will read as duplicates. Continue?';
-  actions.innerHTML =
-    '<button class="btn danger" onclick="doRestart(\'' + jsEsc(id) + '\')">Yes, start over on this phone</button>' +
-    '<button class="btn secondary" style="margin-top:8px" onclick="openResume(\'' + jsEsc(id) + '\',' + count + ')">↩ No, go back</button>';
-}
-
-function doRestart(id) {
-  clearProgress(id);
-  pendingResume = null;
-  document.getElementById('decision').style.display = 'none';
-  paused = false;
-  enterRoute(id, {});
-}
-
-function routeTotal() {
-  var r = DATA.routes.find(function (x) { return x.id === ROUTE; });
-  return r ? r.count : 0;
-}
-function updateCount() {
-  document.getElementById('count-label').textContent =
-    Object.keys(scannedHere).length + ' / ' + routeTotal() + ' on this phone';
-}
-
-// ---------- 4: Camera + validation ----------
-function startCamera() {
-  if (scanner) { scanner.clear().catch(function(){}); }
-  scanner = new Html5Qrcode('reader');
-  scanner.start(
-    { facingMode: 'environment' },
-    { fps: 10, qrbox: { width: 280, height: 160 },
-      formatsToSupport: [
-        Html5QrcodeSupportedFormats.CODE_128,
-        Html5QrcodeSupportedFormats.CODE_39,
-        Html5QrcodeSupportedFormats.EAN_13,
-        Html5QrcodeSupportedFormats.QR_CODE
-      ] },
-    onScan,
-    function () {} // ignore per-frame decode misses
-  ).catch(function (err) {
-    setStatus('bad', 'Camera unavailable', 'Allow camera access in Chrome, or use manual entry below. ' + err);
-  });
-}
-
-function onScan(text) {
-  if (paused) return;                                   // decision modal open
-  if (!document.getElementById('scr-scan').classList.contains('active')) return;
-  var code = String(text).trim().toUpperCase();
-  var now = Date.now();
-  if (code === lastCode && now - lastTime < 2500) return; // debounce duplicate frames
-  lastCode = code; lastTime = now;
-  handleCode(code);
-}
-
-function manualScan() {
-  if (paused) return;
-  ensureAudio();
-  var el = document.getElementById('manual-input');
-  var code = el.value.trim().toUpperCase();
-  if (!code) return;
-  el.value = '';
-  handleCode(code);
-}
-
-function handleCode(code) {
-  var expectedRoute = DATA.codeToRoute[code];
-  var status;
-
-  if (!expectedRoute) {
-    status = 'NOT_FOUND';
-    soundBad(); flash('bad');
-    setStatus('bad', '❌ ' + code, 'Not found in today\'s file');
-    openDecision('NOT_FOUND', code, null);              // Feature 1 / found-location
-  } else if (expectedRoute !== ROUTE) {
-    status = 'WRONG_ROUTE';
-    soundBad(); flash('bad');
-    setStatus('bad', '🚫 WRONG VAN — ' + code, 'Belongs to Route ' + expectedRoute);
-    openDecision('WRONG_ROUTE', code, expectedRoute);   // Feature 1
-  } else if (scannedHere[code]) {
-    status = 'DUPLICATE';
-    soundDup(); flash('warn');
-    setStatus('warn', '↩ Already scanned', code);
-  } else {
-    status = 'OK';
-    scannedHere[code] = true;
-    saveProgress();
-    soundGood(); flash('good');
-    var stop = DATA.codeToStop[code] || '';
-    setStatus('good', '✅ ' + code, stop ? stop : 'Correct van');
-    updateCount();
+  var sheet = SpreadsheetApp.getActive().getSheetByName(CONFIG.LIVE_SHEET);
+  if (sheet && sheet.getLastRow() >= 2) {
+    var values = sheet.getRange(2, 1, sheet.getLastRow() - 1, 6).getValues();
+    var scanned = [];
+    values.forEach(function (r) {
+      if (String(r[0]).trim() === route && String(r[3]).toUpperCase() === 'SCANNED') {
+        scanned.push(String(r[1]).trim().toUpperCase());
+      }
+    });
+    return { route: route, scanned: scanned, source: 'live' };
   }
 
-  addRecent(code, status);
-  // Audit log of every raw scan is preserved exactly as before.
-  queueScan({ scanner: NAME, route: ROUTE, code: code, status: status, expectedRoute: expectedRoute || '' });
+  // Fallback: reconstruct from today's OK scans in ScanLog.
+  var ok = getTodaysOkScans_()[route] || {};
+  return { route: route, scanned: Object.keys(ok), source: 'scanlog' };
 }
 
-// ---------- Decision modal: out-of-route / not-found (Feature 1 + location capture) ----------
-function openDecision(kind, code, belongsToRoute) {
-  paused = true;
-  pending = { kind: kind, code: code, belongsToRoute: belongsToRoute || 'UNKNOWN' };
-  var actions = document.getElementById('decision-actions');
-  document.getElementById('found-loc').style.display = 'none';
-  actions.style.display = 'block';
-
-  if (kind === 'WRONG_ROUTE') {
-    document.getElementById('decision-title').innerHTML = '🚫 ' + code;
-    document.getElementById('decision-sub').textContent =
-      'Belongs to Route ' + belongsToRoute + ' — you are on Route ' + ROUTE + '.';
-    actions.innerHTML =
-      '<button class="btn" onclick="chooseMoved()">✅ I moved it to Route ' + belongsToRoute + '\'s lane</button>' +
-      '<button class="btn secondary" style="margin-top:8px" onclick="chooseAddFound()">📍 Left it here — add to Found list</button>' +
-      '<button class="btn secondary" style="margin-top:8px" onclick="closeDecision()">Skip</button>';
-  } else { // NOT_FOUND
-    document.getElementById('decision-title').innerHTML = '❌ ' + code;
-    document.getElementById('decision-sub').textContent = 'Not in today\'s file — where are you putting it?';
-    actions.innerHTML =
-      '<button class="btn secondary" onclick="chooseAddFound()">📍 Set aside — add to Found list</button>' +
-      '<button class="btn secondary" style="margin-top:8px" onclick="closeDecision()">Skip</button>';
+// ---------- Scan logging ----------
+function getLogSheet_() {
+  var ss = SpreadsheetApp.getActive();
+  var sheet = ss.getSheetByName(CONFIG.SCAN_LOG_SHEET);
+  if (!sheet) {
+    sheet = ss.insertSheet(CONFIG.SCAN_LOG_SHEET);
+    sheet.appendRow(['Timestamp', 'Scanner', 'Selected Route', 'Code', 'Status', 'Expected Route']);
+    sheet.setFrozenRows(1);
   }
-  document.getElementById('decision').style.display = 'flex';
+  return sheet;
 }
 
-// "I moved it to the correct lane" -> count the box as PRESENT on its correct route.
-function chooseMoved() {
-  var p = pending;
-  queueScan({ scanner: NAME, route: p.belongsToRoute, code: p.code, status: 'OK', expectedRoute: p.belongsToRoute });
-  api('resolveFound', { code: p.code, scanner: NAME }).catch(function () {}); // clear it from Found if it was there
-  soundGood();
-  addRecent(p.code, 'MOVED');
-  closeDecision();
-  setStatus('good', '➡️ ' + p.code + ' moved', 'Now counted on Route ' + p.belongsToRoute);
-}
-
-// Show the "where is it?" input.
-function chooseAddFound() {
-  document.getElementById('decision-actions').style.display = 'none';
-  document.getElementById('found-loc').style.display = 'block';
-  document.getElementById('loc-input').focus();
-}
-
-// Save the box + its physical location to the shared Found list.
-function saveFound() {
-  var p = pending;
-  var loc = document.getElementById('loc-input').value.trim();
-  document.getElementById('loc-input').value = '';
-  api('logFound', {
-    code: p.code, belongsToRoute: p.belongsToRoute, location: loc,
-    scanner: NAME, scannedUnderRoute: ROUTE
-  }).then(function () {
-    setStatus('warn', '📍 ' + p.code + ' in Found list', loc || 'location not specified');
-  }).catch(function (e) {
-    setStatus('bad', 'Couldn\'t save to Found list', e.message);
-  });
-  addRecent(p.code, 'FOUND');
-  closeDecision();
-}
-
-function closeDecision() {
-  document.getElementById('decision').style.display = 'none';
-  paused = false; pending = null; lastCode = ''; lastTime = 0;
-}
-
-// ---------- Scan upload with retry (handles brief signal drops) ----------
-var pendingScans = JSON.parse(localStorage.getItem('pendingScans') || '[]');
-var uploading = false;
-function queueScan(scan) {
-  pendingScans.push(scan);
-  localStorage.setItem('pendingScans', JSON.stringify(pendingScans));
-  uploadNext();
-}
-function uploadNext() {
-  if (uploading || pendingScans.length === 0) return;
-  uploading = true;
-  api('logScan', { scan: pendingScans[0] }).then(function () {
-    pendingScans.shift();
-    localStorage.setItem('pendingScans', JSON.stringify(pendingScans));
-    uploading = false;
-    uploadNext();
-  }).catch(function () {
-    uploading = false;
-    setTimeout(uploadNext, 4000); // retry until signal returns
-  });
-}
-uploadNext(); // flush anything left over from a previous session
-
-function addRecent(code, status) {
-  var icon = { OK: '✅', WRONG_ROUTE: '🚫', NOT_FOUND: '❌', DUPLICATE: '↩', MOVED: '➡️', FOUND: '📍' }[status] || '•';
-  var box = document.getElementById('recent');
-  box.insertAdjacentHTML('afterbegin', '<div>' + icon + ' ' + code + '</div>');
-  while (box.children.length > 6) box.removeChild(box.lastChild);
-}
-
-// ---------- 5: Done scanning -> success only here (Feature 2) + missing w/ found cross-ref (Feature 3) ----------
-function confirmRoute() {
-  if (pendingScans.length > 0) {
-    alert(pendingScans.length + ' scan(s) still uploading — wait a few seconds and try again.');
-    uploadNext();
-    return;
+/**
+ * Called from the phone for every scan.
+ * status: OK | WRONG_ROUTE | NOT_FOUND | DUPLICATE
+ * Side effect: an OK scan also stamps the LiveStatus board (auto-updates it).
+ */
+function logScan(scan) {
+  var lock = LockService.getScriptLock();
+  lock.waitLock(10000); // many phones writing at once
+  try {
+    var route = String(scan.route || '');
+    var code = String(scan.code || '').trim().toUpperCase();
+    var status = String(scan.status || '');
+    getLogSheet_().appendRow([
+      new Date(),
+      String(scan.scanner || 'Unknown'),
+      route,
+      code,
+      status,
+      String(scan.expectedRoute || '')
+    ]);
+    // Keep the live board current the moment a box is confirmed present.
+    if (status === 'OK') markLiveScanned_(route, code, scan.scanner);
+  } finally {
+    lock.releaseLock();
   }
-  show('scr-result');
-  document.getElementById('result-body').innerHTML = '<div class="loader">Checking scans from all phones…</div>';
+  return true;
+}
 
-  Promise.all([
-    api('confirmRoute', { route: ROUTE, scanner: NAME }),
-    api('getFoundList', {}).catch(function () { return { found: [] }; })
-  ]).then(function (arr) {
-    var res = arr[0];
-    var found = (arr[1] && arr[1].found) || [];
-    var foundByCode = {};
-    found.forEach(function (f) { if (!foundByCode[f.code]) foundByCode[f.code] = f; }); // newest wins (list is newest-first)
+/**
+ * Called when a driver taps "Confirm route complete".
+ * Looks at TODAY's OK scans across ALL phones and returns boxes still missing.
+ * Also stamps MISSING onto the LiveStatus board for any unscanned box.
+ *
+ * Note: the scanner's "I moved it to the correct lane" action logs an OK scan
+ * against the box's CORRECT route, so those boxes count as present here.
+ */
+function confirmRoute(route, scanner) {
+  route = String(route).trim();
+  var data = getRouteData();
+  var expected = {};
+  Object.keys(data.codeToRoute).forEach(function (code) {
+    if (data.codeToRoute[code] === route) expected[code] = true;
+  });
 
-    var html;
-    if (res.missing.length === 0) {
-      soundGood();
-      clearProgress(ROUTE); // fully done — don't offer to "resume" this route later
-      html = '<div class="complete-banner">🎉 Route ' + res.route + ' complete!<br>' +
-             res.scannedCount + '/' + res.total + ' boxes scanned</div>';
-    } else {
-      soundBad();
-      html = '<div class="missing-list"><b style="color:var(--red)">⚠️ ' + res.missing.length +
-             ' box(es) missing on Route ' + res.route + ' (' + res.scannedCount + '/' + res.total + ' scanned):</b><ul>';
-      res.missing.forEach(function (m) {
-        html += '<li><b>' + m.code + '</b>' + (m.stop ? ' — ' + m.stop : '');
-        var f = foundByCode[m.code];
-        if (f) {
-          // Feature 3: this "missing" box was actually found on another lane.
-          var where = f.location ? f.location : 'location not noted';
-          var seen = f.scannedUnderRoute ? ' (seen on Route ' + f.scannedUnderRoute + ')' : '';
-          html += '<span class="hint">🔎 In Found list — at ' + where + seen + '</span>';
-        }
-        html += '</li>';
+  var scanned = getTodaysOkScans_()[route] || {};
+  var missing = Object.keys(expected)
+    .filter(function (code) { return !scanned[code]; })
+    .map(function (code) { return { code: code, stop: data.codeToStop[code] || '' }; });
+
+  // Reflect the outcome on the live board (empty rows -> MISSING).
+  markLiveMissingForRoute_(route);
+
+  logScan({ scanner: scanner, route: route, code: '— ROUTE CONFIRMED —',
+            status: missing.length ? 'CONFIRMED_WITH_MISSING(' + missing.length + ')' : 'CONFIRMED_COMPLETE',
+            expectedRoute: route });
+
+  return { route: route, total: Object.keys(expected).length,
+           scannedCount: Object.keys(scanned).length, missing: missing };
+}
+
+/** {route: {code: true}} for today's OK scans, all phones combined */
+function getTodaysOkScans_() {
+  var sheet = getLogSheet_();
+  var out = {};
+  if (sheet.getLastRow() < 2) return out;
+  var values = sheet.getRange(2, 1, sheet.getLastRow() - 1, 6).getValues();
+  var tz = Session.getScriptTimeZone();
+  var today = Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd');
+  values.forEach(function (row) {
+    if (!(row[0] instanceof Date)) return;
+    if (Utilities.formatDate(row[0], tz, 'yyyy-MM-dd') !== today) return;
+    if (row[4] !== 'OK') return;
+    var route = String(row[2]);
+    out[route] = out[route] || {};
+    out[route][String(row[3])] = true;
+  });
+  return out;
+}
+
+// ---------- Found boxes (out-of-route / set-aside) ----------
+/** Finds (or creates) the FoundBoxes tab. */
+function foundSheet_() {
+  var ss = SpreadsheetApp.getActive();
+  var sheet = ss.getSheetByName(CONFIG.FOUND_SHEET);
+  if (!sheet) {
+    sheet = ss.insertSheet(CONFIG.FOUND_SHEET);
+    sheet.appendRow(['Timestamp', 'Code', 'BelongsToRoute', 'Location',
+                     'Scanner', 'ScannedUnderRoute', 'Resolved', 'ResolvedBy', 'ResolvedTime']);
+    sheet.setFrozenRows(1);
+  }
+  return sheet;
+}
+
+/**
+ * action: 'logFound' — save an out-of-route / unknown box and where it was left,
+ * so a runner can collect it later. Params: code, belongsToRoute, location,
+ * scanner, scannedUnderRoute.
+ */
+function logFound_(req) {
+  var code = String(req.code || '').trim().toUpperCase();
+  if (!code) throw new Error('Missing code');
+  var lock = LockService.getScriptLock();
+  lock.waitLock(10000);
+  try {
+    foundSheet_().appendRow([
+      new Date(),
+      code,
+      String(req.belongsToRoute || 'UNKNOWN'),
+      String(req.location || ''),
+      String(req.scanner || ''),
+      String(req.scannedUnderRoute || ''),
+      false, '', ''
+    ]);
+  } finally {
+    lock.releaseLock();
+  }
+  return { code: code, saved: true };
+}
+
+/**
+ * action: 'getFoundList' — return found boxes. Unresolved only by default;
+ * pass includeResolved: true to get everything. Newest first.
+ */
+function getFoundList_(req) {
+  var sheet = SpreadsheetApp.getActive().getSheetByName(CONFIG.FOUND_SHEET);
+  if (!sheet || sheet.getLastRow() < 2) return { found: [] };
+
+  var rows = sheet.getRange(2, 1, sheet.getLastRow() - 1, 9).getValues();
+  var includeResolved = req && req.includeResolved;
+  var out = [];
+  for (var i = 0; i < rows.length; i++) {
+    var r = rows[i];
+    var resolved = (r[6] === true) || (String(r[6]).toUpperCase() === 'TRUE');
+    if (includeResolved || !resolved) {
+      out.push({
+        code: String(r[1]),
+        belongsToRoute: String(r[2]),
+        location: String(r[3]),
+        scanner: String(r[4]),
+        scannedUnderRoute: String(r[5]),
+        resolved: resolved,
+        time: r[0] instanceof Date ? r[0].getTime() : 0
       });
-      html += '</ul></div>';
     }
-    document.getElementById('result-body').innerHTML = html;
-  }).catch(function (e) {
-    document.getElementById('result-body').innerHTML = '<p style="color:var(--red)">Error: ' + e.message + '</p>';
-  });
+  }
+  out.sort(function (a, b) { return b.time - a.time; }); // newest first
+  return { found: out };
 }
 
-function backToScan() { show('scr-scan'); }
-function switchRoute() {
-  if (scanner) { scanner.stop().catch(function(){}); scanner = null; }
-  show('scr-route');
-  loadRoutes(); // refresh in case sheet changed
+/**
+ * action: 'resolveFound' — mark all open rows for a code as collected.
+ * Params: code, scanner.
+ */
+function resolveFound_(req) {
+  var code = String((req && req.code) || '').trim().toUpperCase();
+  if (!code) return { code: code, resolved: 0 };
+  var sheet = SpreadsheetApp.getActive().getSheetByName(CONFIG.FOUND_SHEET);
+  if (!sheet || sheet.getLastRow() < 2) return { code: code, resolved: 0 };
+
+  var lock = LockService.getScriptLock();
+  lock.waitLock(10000);
+  var n = 0;
+  try {
+    var rng = sheet.getRange(2, 1, sheet.getLastRow() - 1, 9);
+    var rows = rng.getValues();
+    for (var i = 0; i < rows.length; i++) {
+      var resolved = (rows[i][6] === true) || (String(rows[i][6]).toUpperCase() === 'TRUE');
+      if (String(rows[i][1]).toUpperCase() === code && !resolved) {
+        rows[i][6] = true;
+        rows[i][7] = String((req && req.scanner) || '');
+        rows[i][8] = new Date();
+        n++;
+      }
+    }
+    if (n) rng.setValues(rows);
+  } finally {
+    lock.releaseLock();
+  }
+  return { code: code, resolved: n };
 }
 
-// ---------- 6: Missing-boxes mode: the Found list ----------
-function loadFound() {
-  document.getElementById('found-body').innerHTML = '<div class="loader">Loading Found list…</div>';
-  api('getFoundList', {}).then(function (data) {
-    FOUND = (data && data.found) || [];
-    renderFound();
-  }).catch(function (e) {
-    document.getElementById('found-body').innerHTML =
-      '<p style="color:var(--red)">Error: ' + e.message +
-      '</p><button class="btn secondary" style="margin-top:12px" onclick="loadFound()">Retry</button>';
-  });
-}
+// ---------- Nightly Slack report ----------
+function sendNightlyReport() {
+  var data = getRouteData();
+  var okScans = getTodaysOkScans_();
+  var wrongAndUnknown = getTodaysProblemScans_();
+  var tz = Session.getScriptTimeZone();
+  var today = Utilities.formatDate(new Date(), tz, 'EEE, MMM d yyyy');
 
-function renderFound() {
-  var q = document.getElementById('found-search').value.trim().toUpperCase();
-  var list = FOUND.filter(function (f) {
-    if (!q) return true;
-    return (f.code && f.code.toUpperCase().indexOf(q) >= 0) ||
-           (f.belongsToRoute && String(f.belongsToRoute).toUpperCase().indexOf(q) >= 0);
+  // Expected codes per route
+  var expectedByRoute = {};
+  Object.keys(data.codeToRoute).forEach(function (code) {
+    var r = data.codeToRoute[code];
+    expectedByRoute[r] = expectedByRoute[r] || [];
+    expectedByRoute[r].push(code);
   });
-  // Unresolved first, then resolved.
-  list.sort(function (a, b) { return (a.resolved === b.resolved) ? 0 : (a.resolved ? 1 : -1); });
 
-  if (list.length === 0) {
-    document.getElementById('found-body').innerHTML =
-      '<div class="empty">No found boxes right now. 🎉</div>';
-    return;
+  var lines = ['*' + CONFIG.REPORT_TITLE + ' — ' + today + '*', ''];
+  var totalExpected = 0, totalScanned = 0, totalMissing = 0;
+  var routesWithIssues = 0;
+
+  Object.keys(expectedByRoute)
+    .sort(function (a, b) { return (Number(a) || 0) - (Number(b) || 0) || a.localeCompare(b); })
+    .forEach(function (route) {
+      var expected = expectedByRoute[route];
+      var scanned = okScans[route] || {};
+      var missing = expected.filter(function (c) { return !scanned[c]; });
+      totalExpected += expected.length;
+      totalScanned += Object.keys(scanned).length;
+      totalMissing += missing.length;
+
+      if (missing.length === 0) {
+        lines.push(':white_check_mark: *Route ' + route + '* — ' + expected.length + '/' + expected.length + ' boxes scanned');
+      } else {
+        routesWithIssues++;
+        lines.push(':x: *Route ' + route + '* — ' + Object.keys(scanned).length + '/' + expected.length +
+                   ' scanned, *' + missing.length + ' missing:*');
+        missing.forEach(function (code) {
+          var stop = data.codeToStop[code];
+          lines.push('     • `' + code + '`' + (stop ? ' — ' + stop : ''));
+        });
+      }
+    });
+
+  // Wrong-route / unknown scans
+  if (wrongAndUnknown.length) {
+    lines.push('');
+    lines.push(':warning: *Wrong-route / unknown scans today:*');
+    wrongAndUnknown.forEach(function (s) {
+      if (s.status === 'WRONG_ROUTE') {
+        lines.push('     • `' + s.code + '` scanned into route ' + s.route + ' but belongs to route ' + s.expectedRoute + ' (' + s.scanner + ')');
+      } else {
+        lines.push('     • `' + s.code + '` scanned into route ' + s.route + ' — *not found in today\'s file* (' + s.scanner + ')');
+      }
+    });
   }
 
-  var html = '';
-  list.forEach(function (f) {
-    html += '<div class="found-card' + (f.resolved ? ' resolved' : '') + '">' +
-            '<div class="fc-code">' + f.code +
-            (f.resolved ? '<span class="badge done">collected</span>'
-                        : '<span class="badge">to collect</span>') + '</div>' +
-            '<div class="fc-meta">Belongs to Route <b>' + f.belongsToRoute + '</b>' +
-            (f.scannedUnderRoute ? ' · seen on Route ' + f.scannedUnderRoute : '') + '</div>' +
-            '<div class="fc-loc">📍 ' + (f.location || 'location not noted') + '</div>' +
-            (f.scanner ? '<div class="fc-meta">by ' + f.scanner + '</div>' : '') +
-            (f.resolved ? '' :
-              '<button class="btn" onclick="markCollected(\'' + jsEsc(f.code) + '\')">✅ Mark collected</button>') +
-            '</div>';
-  });
-  document.getElementById('found-body').innerHTML = html;
-}
-
-function markCollected(code) {
-  api('resolveFound', { code: code, scanner: NAME }).then(function () {
-    // reflect immediately, then refresh from server
-    FOUND.forEach(function (f) { if (f.code === code) f.resolved = true; });
-    renderFound();
-    loadFound();
-  }).catch(function (e) { alert('Could not mark collected: ' + e.message); });
-}
-
-function jsEsc(s) { return String(s).replace(/\\/g, '\\\\').replace(/'/g, "\\'"); }
-
-if (NAME) document.getElementById('who').textContent = NAME;
-
-// ---------- Restore where the user was after a refresh / accidental close ----------
-(function restoreSession() {
-  if (!NAME) return; // no name yet -> stay on name screen
-  var s;
-  try { s = JSON.parse(localStorage.getItem('session') || 'null'); } catch (e) { s = null; }
-  if (!s) { show('scr-mode'); return; }
-  MODE = s.mode || null;
-
-  if (s.screen === 'scr-found') { MODE = 'missing'; show('scr-found'); loadFound(); return; }
-
-  if ((s.screen === 'scr-scan' || s.screen === 'scr-result') && s.route) {
-    // Re-enter the route they were scanning, restoring their loaded boxes.
-    // Camera can't auto-start without a user gesture on some phones, so we land
-    // on the scan screen and the first tap/scan attempt re-arms it; but we try anyway.
-    MODE = 'normal';
-    show('scr-mode');            // ensures DATA loads, then hop to route
-    // Pull route data (cache-first) so routeTotal() works, then enter the route.
-    var cache = readRouteCache();
-    if (cache) { DATA = cache.data; enterRouteAfterRefresh(s.route); }
-    else {
-      api('getRouteData').then(function (d) { cacheRouteData(d); DATA = d; enterRouteAfterRefresh(s.route); })
-                         .catch(function () { show('scr-route'); loadRoutes(); });
-    }
-    return;
+  // Found boxes still set aside on the wrong lane (unresolved)
+  var found = getFoundList_({}).found;
+  if (found.length) {
+    lines.push('');
+    lines.push(':package: *Boxes set aside on wrong lane (not yet collected):*');
+    found.forEach(function (f) {
+      lines.push('     • `' + f.code + '` belongs to route ' + f.belongsToRoute +
+                 ' — at ' + (f.location || 'location not noted') +
+                 (f.scannedUnderRoute ? ' (seen on route ' + f.scannedUnderRoute + ')' : '') +
+                 ' — ' + (f.scanner || 'unknown'));
+    });
   }
 
-  if (s.screen === 'scr-route') { MODE = 'normal'; show('scr-route'); loadRoutes(); return; }
-  show('scr-mode');
-})();
+  lines.push('');
+  lines.push('*Summary:* ' + totalScanned + '/' + totalExpected + ' boxes scanned · ' +
+             totalMissing + ' missing · ' + routesWithIssues + ' route(s) with issues' +
+             (found.length ? ' · ' + found.length + ' set aside' : ''));
 
-// Enter a route on refresh WITHOUT re-prompting resume (we auto-resume silently here,
-// because the user didn't just tap the route — they were already in it). Pull server
-// progress so a refresh on a replacement phone also resumes correctly.
-function enterRouteAfterRefresh(route) {
-  var localMap = loadProgress(route);
-  api('getRouteProgress', { route: route }).then(function (res) {
-    var merged = Object.assign({}, localMap);
-    (res.scanned || []).forEach(function (c) { merged[String(c).trim().toUpperCase()] = true; });
-    enterRoute(route, merged);
-  }).catch(function () {
-    enterRoute(route, localMap);
+  postToSlack_(lines.join('\n'));
+}
+
+/** Today's WRONG_ROUTE and NOT_FOUND scans (deduped) */
+function getTodaysProblemScans_() {
+  var sheet = getLogSheet_();
+  var out = [], seen = {};
+  if (sheet.getLastRow() < 2) return out;
+  var values = sheet.getRange(2, 1, sheet.getLastRow() - 1, 6).getValues();
+  var tz = Session.getScriptTimeZone();
+  var today = Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd');
+  values.forEach(function (row) {
+    if (!(row[0] instanceof Date)) return;
+    if (Utilities.formatDate(row[0], tz, 'yyyy-MM-dd') !== today) return;
+    var status = String(row[4]);
+    if (status !== 'WRONG_ROUTE' && status !== 'NOT_FOUND') return;
+    var key = status + '|' + row[3] + '|' + row[2];
+    if (seen[key]) return;
+    seen[key] = true;
+    out.push({ scanner: String(row[1]), route: String(row[2]), code: String(row[3]),
+               status: status, expectedRoute: String(row[5]) });
+  });
+  return out;
+}
+
+function postToSlack_(text) {
+  if (!CONFIG.SLACK_WEBHOOK_URL || CONFIG.SLACK_WEBHOOK_URL.indexOf('http') !== 0) {
+    throw new Error('Slack webhook URL not set in CONFIG.SLACK_WEBHOOK_URL');
+  }
+  UrlFetchApp.fetch(CONFIG.SLACK_WEBHOOK_URL, {
+    method: 'post',
+    contentType: 'application/json',
+    payload: JSON.stringify({ text: text })
   });
 }
-</script>
-</body>
-</html>
+
+// ---------- Start Fresh Night (one button does it all) ----------
+/**
+ * The button you click AFTER pasting the new route export into the sheet.
+ * In order: wipe yesterday's ScanLog -> rebuild the LiveStatus board (resets the
+ * status column to empty from the new sheet) -> bump the version so every phone
+ * drops its cached routes and re-downloads. Confirms first (destructive).
+ */
+function startFreshNight() {
+  var ui = SpreadsheetApp.getUi();
+  var resp = ui.alert(
+    'Start a fresh night?',
+    'This will:\n' +
+    '  1. Clear ALL of yesterday\'s scans from "' + CONFIG.SCAN_LOG_SHEET + '"\n' +
+    '  2. Rebuild the "' + CONFIG.LIVE_SHEET + '" board from the current sheet (all statuses reset to empty)\n' +
+    '  3. Force every phone to reload the new routes\n\n' +
+    'Do this only after you\'ve pasted in tonight\'s route export. Continue?',
+    ui.ButtonSet.YES_NO);
+  if (resp !== ui.Button.YES) return;
+
+  // 1. Wipe yesterday's scan log.
+  var log = getLogSheet_();
+  if (log.getLastRow() > 1) log.deleteRows(2, log.getLastRow() - 1);
+
+  // 2. Rebuild the live board from the (new) route file.
+  var n = rebuildLiveStatus_();
+
+  // 3. Invalidate every phone's cached routes.
+  var v = bumpDataVersion_();
+
+  ui.alert('Fresh night ready ✅',
+    n + ' boxes loaded onto the ' + CONFIG.LIVE_SHEET + ' board.\n' +
+    'Yesterday\'s scans cleared.\n' +
+    'Phones will pull the new routes on their next load (version ' + v + ').',
+    ui.ButtonSet.OK);
+}
+
+// ---------- Setup helpers (spreadsheet menu) ----------
+function onOpen() {
+  SpreadsheetApp.getUi().createMenu('📦 Box Scanner')
+    .addItem('🚀 Start Fresh Night (after pasting new routes)', 'startFreshNight')
+    .addSeparator()
+    .addItem('Send Slack report now', 'sendNightlyReport')
+    .addItem('Install nightly auto-report trigger', 'installNightlyTrigger')
+    .addToUi();
+}
+
+function installNightlyTrigger() {
+  // Remove existing copies first
+  ScriptApp.getProjectTriggers().forEach(function (t) {
+    if (t.getHandlerFunction() === 'sendNightlyReport') ScriptApp.deleteTrigger(t);
+  });
+  ScriptApp.newTrigger('sendNightlyReport')
+    .timeBased().atHour(CONFIG.REPORT_HOUR).everyDays(1).create();
+  SpreadsheetApp.getUi().alert('Done! The Slack report will send automatically every day around ' +
+    CONFIG.REPORT_HOUR + ':00 (' + Session.getScriptTimeZone() + ').');
+}
