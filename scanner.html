@@ -189,12 +189,48 @@ function api(action, params) {
 var DATA = null;          // {routes, codeToRoute, codeToStop}
 var ROUTE = null;
 var NAME = localStorage.getItem('scannerName') || '';
+var MODE = null;          // 'normal' | 'missing' — persisted so refresh restores context
 var scannedHere = {};     // codes OK-scanned on THIS phone for this route
 var lastCode = '', lastTime = 0;
 var scanner = null;
 var paused = false;       // true while the decision modal is open
 var pending = null;       // {kind, code, belongsToRoute} for the open decision
 var FOUND = [];           // cache for missing-boxes mode
+
+// ---------- Persistence: survive a page refresh / accidental close ----------
+// Which screen the user is on, plus route+mode, so a reload lands them back.
+function saveSession() {
+  try {
+    localStorage.setItem('session', JSON.stringify({
+      screen: (document.querySelector('.screen.active') || {}).id || 'scr-name',
+      route: ROUTE, mode: MODE
+    }));
+  } catch (e) {}
+}
+// Per-route, per-phone scan progress. Keyed by route so switching routes is safe.
+function progressKey(route) { return 'progress:' + (route || ROUTE); }
+function saveProgress() {
+  if (!ROUTE) return;
+  try { localStorage.setItem(progressKey(ROUTE), JSON.stringify(scannedHere)); } catch (e) {}
+}
+function loadProgress(route) {
+  try { return JSON.parse(localStorage.getItem(progressKey(route)) || '{}'); } catch (e) { return {}; }
+}
+function clearProgress(route) { localStorage.removeItem(progressKey(route)); }
+function progressCount(route) { return Object.keys(loadProgress(route)).length; }
+
+// ---------- Route-data cache (makes the route list appear instantly) ----------
+var ROUTE_CACHE_TTL = 5 * 60 * 1000; // 5 min — long enough for a shift, short enough to catch sheet edits
+function cacheRouteData(data) {
+  try { localStorage.setItem('routeData', JSON.stringify({ t: Date.now(), data: data })); } catch (e) {}
+}
+function readRouteCache() {
+  try {
+    var c = JSON.parse(localStorage.getItem('routeData') || 'null');
+    if (!c || !c.data) return null;
+    return { fresh: (Date.now() - c.t) < ROUTE_CACHE_TTL, data: c.data };
+  } catch (e) { return null; }
+}
 
 // ---------- Sounds (Web Audio, no files needed) ----------
 var actx = null;
@@ -225,6 +261,7 @@ function ensureAudio() {
 function show(id) {
   document.querySelectorAll('.screen').forEach(function (s) { s.classList.remove('active'); });
   document.getElementById(id).classList.add('active');
+  saveSession();
 }
 function flash(cls) {
   var f = document.getElementById('flash');
@@ -252,44 +289,161 @@ function changeName() { show('scr-name'); }
 // ---------- 2: Mode pick (Features 4/5/6) ----------
 function startNormal() {
   ensureAudio();
+  MODE = 'normal';
   show('scr-route');
   loadRoutes();
 }
 function startMissing() {
   ensureAudio();
+  MODE = 'missing';
   if (scanner) { scanner.stop().catch(function(){}); scanner = null; }
   show('scr-found');
   loadFound();
 }
 
 // ---------- 3: Routes ----------
+function renderRouteList(data) {
+  DATA = data;
+  // Build once as a single string (fast), rely on delegated click handler below —
+  // no per-row inline onclick, which parses faster for long lists.
+  var parts = [];
+  data.routes.forEach(function (r) {
+    var done = progressCount(r.id);
+    var tag = done > 0
+      ? '<span>' + done + '/' + r.count + ' loaded</span>'
+      : '<span>' + r.count + ' boxes</span>';
+    parts.push('<button class="route-btn" data-route="' + r.id + '">' +
+               '<b>Route ' + r.id + '</b>' + tag + '</button>');
+  });
+  document.getElementById('route-list').innerHTML =
+    parts.join('') || '<p>No routes found in the sheet.</p>';
+}
+
 function loadRoutes() {
-  document.getElementById('route-list').innerHTML = '<div class="loader">Loading routes…</div>';
+  var el = document.getElementById('route-list');
+  var cache = readRouteCache();
+
+  // 1) Instant paint from cache if we have anything at all.
+  if (cache) {
+    renderRouteList(cache.data);
+    if (cache.fresh) return; // fresh enough — skip the network round-trip entirely
+  } else {
+    el.innerHTML = '<div class="loader">Loading routes…</div>';
+  }
+
+  // 2) Refresh in the background (or foreground if there was no cache).
   api('getRouteData').then(function (data) {
-    DATA = data;
-    var html = '';
-    data.routes.forEach(function (r) {
-      html += '<button class="route-btn" onclick="pickRoute(\'' + r.id + '\')">' +
-              '<b>Route ' + r.id + '</b><span>' + r.count + ' boxes</span></button>';
-    });
-    document.getElementById('route-list').innerHTML = html || '<p>No routes found in the sheet.</p>';
+    cacheRouteData(data);
+    // Only repaint if the route screen is still showing, to avoid clobbering.
+    if (document.getElementById('scr-route').classList.contains('active')) renderRouteList(data);
+    else DATA = data;
   }).catch(function (e) {
-    document.getElementById('route-list').innerHTML =
-      '<p style="color:var(--red)">Error: ' + e.message +
-      '</p><button class="btn secondary" style="margin-top:12px" onclick="loadRoutes()">Retry</button>';
+    if (!cache) {
+      el.innerHTML = '<p style="color:var(--red)">Error: ' + e.message +
+        '</p><button class="btn secondary" style="margin-top:12px" onclick="loadRoutes()">Retry</button>';
+    }
+    // If we had cache, silently keep showing it.
   });
 }
 
+// Delegated click handler for the route buttons (one listener, not N).
+document.getElementById('route-list').addEventListener('click', function (ev) {
+  var btn = ev.target.closest('.route-btn');
+  if (btn && btn.dataset.route) pickRoute(btn.dataset.route);
+});
+
 function pickRoute(id) {
   ensureAudio();
+  // Ask the SERVER what's already scanned for this route (survives a dead phone,
+  // and covers boxes scanned on other phones). Fall back to local if offline.
+  setStatus('', 'Checking route progress…');
+  var localMap = loadProgress(id);
+  api('getRouteProgress', { route: id }).then(function (res) {
+    var serverMap = {};
+    (res.scanned || []).forEach(function (c) { serverMap[String(c).trim().toUpperCase()] = true; });
+    // Merge: anything scanned on the server OR locally counts as done.
+    var merged = Object.assign({}, localMap, serverMap);
+    decideResume(id, merged);
+  }).catch(function () {
+    // Offline / server hiccup — use whatever this phone has locally.
+    decideResume(id, localMap);
+  });
+}
+
+// Given a merged progress map, either enter directly or prompt to resume.
+function decideResume(id, merged) {
+  var count = Object.keys(merged).length;
+  if (count > 0) {
+    // Stash the merged map so resumeRoute can seed from it (not just local).
+    pendingResume = { id: id, map: merged };
+    openResume(id, count);
+  } else {
+    enterRoute(id, {});
+  }
+}
+var pendingResume = null;
+
+// Actually enter the scan screen with a given starting progress map.
+function enterRoute(id, progress) {
   ROUTE = id;
-  scannedHere = {};
+  scannedHere = progress || {};
+  saveProgress();
   document.getElementById('route-label').textContent = id;
   updateCount();
   document.getElementById('recent').innerHTML = '';
-  setStatus('', 'Point camera at a box label');
+  var n = Object.keys(scannedHere).length;
+  setStatus(n ? 'good' : '', n ? '▶️ Resumed — ' + n + ' already loaded' : 'Point camera at a box label',
+            n ? 'Keep scanning the rest' : '');
   show('scr-scan');
   startCamera();
+}
+
+// ----- Resume vs. start-over prompt (reuses the decision modal chrome) -----
+function openResume(id, count) {
+  paused = true;
+  var total = 0;
+  if (DATA) { var r = DATA.routes.find(function (x) { return x.id === id; }); total = r ? r.count : 0; }
+  document.getElementById('found-loc').style.display = 'none';
+  var actions = document.getElementById('decision-actions');
+  actions.style.display = 'block';
+  document.getElementById('decision-title').innerHTML = '▶️ Route ' + id;
+  document.getElementById('decision-sub').innerHTML =
+    '<b>' + count + '</b> box' + (count === 1 ? '' : 'es') + ' already loaded' +
+    (total ? ' (of ' + total + ')' : '') + ' for this route.<br>Do you want to continue where it was left off?';
+  actions.innerHTML =
+    '<button class="btn" onclick="resumeRoute(\'' + jsEsc(id) + '\')">✅ Continue — keep the ' + count + ' scanned</button>' +
+    '<button class="btn danger" style="margin-top:8px" onclick="promptRestart(\'' + jsEsc(id) + '\',' + count + ')">🗑 Start over from zero</button>';
+  document.getElementById('decision').style.display = 'flex';
+}
+
+function resumeRoute(id) {
+  document.getElementById('decision').style.display = 'none';
+  paused = false;
+  // Prefer the merged (server+local) map captured at prompt time.
+  var map = (pendingResume && pendingResume.id === id) ? pendingResume.map : loadProgress(id);
+  pendingResume = null;
+  enterRoute(id, map);
+}
+
+// Second confirmation with an explicit warning before destroying progress.
+function promptRestart(id, count) {
+  var actions = document.getElementById('decision-actions');
+  document.getElementById('decision-title').innerHTML = '⚠️ Start over?';
+  document.getElementById('decision-sub').innerHTML =
+    'This clears the <b>' + count + ' box' + (count === 1 ? '' : 'es') +
+    '</b> already scanned for Route ' + id + ' on this phone. The night\'s master log and the ' +
+    'Live Status board are not erased — but this phone will show zero and re-scans will read as duplicates. Continue?';
+  actions.innerHTML =
+    '<button class="btn danger" onclick="doRestart(\'' + jsEsc(id) + '\')">Yes, start over on this phone</button>' +
+    '<button class="btn secondary" style="margin-top:8px" onclick="openResume(\'' + jsEsc(id) + '\',' + count + ')">↩ No, go back</button>';
+}
+
+function doRestart(id) {
+  clearProgress(id);
+  pendingResume = null;
+  document.getElementById('decision').style.display = 'none';
+  paused = false;
+  enterRoute(id, {});
 }
 
 function routeTotal() {
@@ -362,6 +516,7 @@ function handleCode(code) {
   } else {
     status = 'OK';
     scannedHere[code] = true;
+    saveProgress();
     soundGood(); flash('good');
     var stop = DATA.codeToStop[code] || '';
     setStatus('good', '✅ ' + code, stop ? stop : 'Correct van');
@@ -491,6 +646,7 @@ function confirmRoute() {
     var html;
     if (res.missing.length === 0) {
       soundGood();
+      clearProgress(ROUTE); // fully done — don't offer to "resume" this route later
       html = '<div class="complete-banner">🎉 Route ' + res.route + ' complete!<br>' +
              res.scannedCount + '/' + res.total + ' boxes scanned</div>';
     } else {
@@ -581,6 +737,50 @@ function markCollected(code) {
 function jsEsc(s) { return String(s).replace(/\\/g, '\\\\').replace(/'/g, "\\'"); }
 
 if (NAME) document.getElementById('who').textContent = NAME;
+
+// ---------- Restore where the user was after a refresh / accidental close ----------
+(function restoreSession() {
+  if (!NAME) return; // no name yet -> stay on name screen
+  var s;
+  try { s = JSON.parse(localStorage.getItem('session') || 'null'); } catch (e) { s = null; }
+  if (!s) { show('scr-mode'); return; }
+  MODE = s.mode || null;
+
+  if (s.screen === 'scr-found') { MODE = 'missing'; show('scr-found'); loadFound(); return; }
+
+  if ((s.screen === 'scr-scan' || s.screen === 'scr-result') && s.route) {
+    // Re-enter the route they were scanning, restoring their loaded boxes.
+    // Camera can't auto-start without a user gesture on some phones, so we land
+    // on the scan screen and the first tap/scan attempt re-arms it; but we try anyway.
+    MODE = 'normal';
+    show('scr-mode');            // ensures DATA loads, then hop to route
+    // Pull route data (cache-first) so routeTotal() works, then enter the route.
+    var cache = readRouteCache();
+    if (cache) { DATA = cache.data; enterRouteAfterRefresh(s.route); }
+    else {
+      api('getRouteData').then(function (d) { cacheRouteData(d); DATA = d; enterRouteAfterRefresh(s.route); })
+                         .catch(function () { show('scr-route'); loadRoutes(); });
+    }
+    return;
+  }
+
+  if (s.screen === 'scr-route') { MODE = 'normal'; show('scr-route'); loadRoutes(); return; }
+  show('scr-mode');
+})();
+
+// Enter a route on refresh WITHOUT re-prompting resume (we auto-resume silently here,
+// because the user didn't just tap the route — they were already in it). Pull server
+// progress so a refresh on a replacement phone also resumes correctly.
+function enterRouteAfterRefresh(route) {
+  var localMap = loadProgress(route);
+  api('getRouteProgress', { route: route }).then(function (res) {
+    var merged = Object.assign({}, localMap);
+    (res.scanned || []).forEach(function (c) { merged[String(c).trim().toUpperCase()] = true; });
+    enterRoute(route, merged);
+  }).catch(function () {
+    enterRoute(route, localMap);
+  });
+}
 </script>
 </body>
 </html>
