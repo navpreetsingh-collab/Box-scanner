@@ -2,6 +2,7 @@
 <html>
 <head>
   <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
   <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
   <style>
     :root {
@@ -29,7 +30,7 @@
     .btn.danger { background: var(--red); }
     .btn:disabled { opacity: .5; }
     .route-btn { width: 100%; padding: 16px; margin-bottom: 10px; font-size: 18px; border-radius: 12px;
-                 border: 2px solid #cdd6c8; background: #fff; display: flex; justify-content: space-between; cursor: pointer; }
+                 border: 2px solid #cdd6c8; background: #fff; display: flex; justify-content: space-between; align-items:center; cursor: pointer; text-align:left; }
     .route-btn b { font-size: 18px; }
     .route-btn span { color: #6b7a6b; }
 
@@ -50,12 +51,33 @@
     .manual input { flex: 1; margin: 0; }
     .manual button { width: auto; padding: 0 18px; }
     .missing-list { background: #fff; border: 2px solid var(--red); border-radius: 12px; padding: 14px; margin: 14px 0; }
-    .missing-list li { margin: 6px 0 6px 18px; font-size: 16px; }
+    .missing-list li { margin: 8px 0 8px 18px; font-size: 16px; list-style: none; }
+    .missing-list li .hint { display:block; font-size:13px; color:#8a6d1f; font-weight:600; margin-top:2px; }
     .complete-banner { background: var(--hf-green); color: #fff; border-radius: 12px; padding: 18px;
                        text-align: center; font-size: 20px; font-weight: 800; margin: 14px 0; }
     .loader { text-align: center; padding: 40px; color: #6b7a6b; }
     .recent { font-size: 13px; color: #6b7a6b; margin-top: 10px; }
     .recent div { padding: 3px 0; border-bottom: 1px solid #e3e8de; }
+
+    /* Decision modal (wrong route / not found) */
+    .decision-panel { position: fixed; inset: 0; background: rgba(0,0,0,.55); display: none;
+                      align-items: center; justify-content: center; padding: 20px; z-index: 100; }
+    .decision-card { background: #fff; border-radius: 16px; padding: 20px; max-width: 420px; width: 100%;
+                     box-shadow: 0 12px 40px rgba(0,0,0,.3); }
+    #decision-title { font-size: 22px; font-weight: 800; margin-bottom: 4px; word-break: break-all; }
+    .decision-sub { color: #6b7a6b; font-size: 15px; margin-bottom: 16px; }
+
+    /* Found list (missing-boxes mode) */
+    .found-card { background: #fff; border: 2px solid #cdd6c8; border-radius: 12px; padding: 12px 14px; margin-bottom: 10px; }
+    .found-card.resolved { opacity: .55; border-style: dashed; }
+    .found-card .fc-code { font-size: 18px; font-weight: 800; word-break: break-all; }
+    .found-card .fc-meta { font-size: 14px; color: #6b7a6b; margin: 3px 0; }
+    .found-card .fc-loc { font-size: 15px; font-weight: 700; color: var(--ink); }
+    .found-card .btn { margin-top: 8px; padding: 10px; font-size: 15px; }
+    .badge { display: inline-block; background: var(--amber); color: #fff; font-size: 12px; font-weight: 700;
+             padding: 2px 8px; border-radius: 20px; margin-left: 6px; }
+    .badge.done { background: var(--hf-green-dark); }
+    .empty { text-align:center; color:#6b7a6b; padding:30px 10px; }
   </style>
 </head>
 <body>
@@ -70,14 +92,26 @@
     <button class="btn" onclick="saveName()">Continue</button>
   </div>
 
-  <!-- 2: ROUTE PICK -->
+  <!-- 2: MODE PICK  (Feature 4) -->
+  <div class="screen" id="scr-mode">
+    <h1>What are you doing tonight?</h1>
+    <p class="sub">Pick how you want to use the scanner.</p>
+    <button class="route-btn" onclick="startNormal()">
+      <b>📦 Normal scan</b><span>Load a route</span></button>
+    <button class="route-btn" onclick="startMissing()">
+      <b>🔎 Find missing boxes</b><span>See the Found list</span></button>
+    <button class="btn secondary" style="margin-top:10px" onclick="changeName()">Change name</button>
+  </div>
+
+  <!-- 3: ROUTE PICK -->
   <div class="screen" id="scr-route">
     <h1>Select your route</h1>
     <p class="sub">You must pick a route before scanning.</p>
     <div id="route-list" class="loader">Loading routes…</div>
+    <button class="btn secondary" style="margin-top:10px" onclick="show('scr-mode')">↩ Back</button>
   </div>
 
-  <!-- 3: SCAN -->
+  <!-- 4: SCAN -->
   <div class="screen" id="scr-scan">
     <div class="progress">
       <span>Route <b id="route-label"></b></span>
@@ -89,17 +123,43 @@
       <input type="text" id="manual-input" placeholder="Type code if barcode won't scan">
       <button class="btn secondary" onclick="manualScan()">Check</button>
     </div>
-    <button class="btn" onclick="confirmRoute()" id="confirm-btn">✅ Confirm all boxes scanned</button>
+    <button class="btn" onclick="confirmRoute()" id="confirm-btn">✅ Done scanning this route</button>
     <button class="btn secondary" style="margin-top:10px" onclick="switchRoute()">↩ Switch route</button>
     <div class="recent" id="recent"></div>
   </div>
 
-  <!-- 4: CONFIRM RESULT -->
+  <!-- 5: CONFIRM RESULT -->
   <div class="screen" id="scr-result">
     <h1>Route check</h1>
     <div id="result-body" class="loader">Checking all phones…</div>
     <button class="btn" onclick="backToScan()">↩ Keep scanning this route</button>
     <button class="btn secondary" style="margin-top:10px" onclick="switchRoute()">Pick another route</button>
+  </div>
+
+  <!-- 6: FOUND LIST (missing-boxes mode) -->
+  <div class="screen" id="scr-found">
+    <h1>Found boxes</h1>
+    <p class="sub">Boxes set aside on the wrong lane — go collect them.</p>
+    <div class="manual">
+      <input type="text" id="found-search" placeholder="Filter by code or route" oninput="renderFound()">
+      <button class="btn secondary" onclick="loadFound()">↻</button>
+    </div>
+    <div id="found-body" class="loader">Loading…</div>
+    <button class="btn secondary" style="margin-top:12px" onclick="show('scr-mode')">↩ Back</button>
+  </div>
+
+  <!-- Decision modal -->
+  <div class="decision-panel" id="decision">
+    <div class="decision-card">
+      <div id="decision-title"></div>
+      <div id="decision-sub" class="decision-sub"></div>
+      <div id="decision-actions"></div>
+      <div id="found-loc" style="display:none">
+        <input type="text" id="loc-input" placeholder="Where is it? e.g. Lane 12 / overflow rack">
+        <button class="btn" onclick="saveFound()">📍 Save to Found list</button>
+        <button class="btn secondary" style="margin-top:8px" onclick="closeDecision()">Cancel</button>
+      </div>
+    </div>
   </div>
 
 <script>
@@ -132,6 +192,9 @@ var NAME = localStorage.getItem('scannerName') || '';
 var scannedHere = {};     // codes OK-scanned on THIS phone for this route
 var lastCode = '', lastTime = 0;
 var scanner = null;
+var paused = false;       // true while the decision modal is open
+var pending = null;       // {kind, code, belongsToRoute} for the open decision
+var FOUND = [];           // cache for missing-boxes mode
 
 // ---------- Sounds (Web Audio, no files needed) ----------
 var actx = null;
@@ -182,11 +245,24 @@ function saveName() {
   if (!NAME) { alert('Please enter your name'); return; }
   localStorage.setItem('scannerName', NAME);
   document.getElementById('who').textContent = NAME;
+  show('scr-mode');
+}
+function changeName() { show('scr-name'); }
+
+// ---------- 2: Mode pick (Features 4/5/6) ----------
+function startNormal() {
+  ensureAudio();
   show('scr-route');
   loadRoutes();
 }
+function startMissing() {
+  ensureAudio();
+  if (scanner) { scanner.stop().catch(function(){}); scanner = null; }
+  show('scr-found');
+  loadFound();
+}
 
-// ---------- 2: Routes ----------
+// ---------- 3: Routes ----------
 function loadRoutes() {
   document.getElementById('route-list').innerHTML = '<div class="loader">Loading routes…</div>';
   api('getRouteData').then(function (data) {
@@ -225,7 +301,7 @@ function updateCount() {
     Object.keys(scannedHere).length + ' / ' + routeTotal() + ' on this phone';
 }
 
-// ---------- 3: Camera + validation ----------
+// ---------- 4: Camera + validation ----------
 function startCamera() {
   if (scanner) { scanner.clear().catch(function(){}); }
   scanner = new Html5Qrcode('reader');
@@ -246,6 +322,8 @@ function startCamera() {
 }
 
 function onScan(text) {
+  if (paused) return;                                   // decision modal open
+  if (!document.getElementById('scr-scan').classList.contains('active')) return;
   var code = String(text).trim().toUpperCase();
   var now = Date.now();
   if (code === lastCode && now - lastTime < 2500) return; // debounce duplicate frames
@@ -254,6 +332,7 @@ function onScan(text) {
 }
 
 function manualScan() {
+  if (paused) return;
   ensureAudio();
   var el = document.getElementById('manual-input');
   var code = el.value.trim().toUpperCase();
@@ -264,16 +343,18 @@ function manualScan() {
 
 function handleCode(code) {
   var expectedRoute = DATA.codeToRoute[code];
-  var status, sub = '';
+  var status;
 
   if (!expectedRoute) {
     status = 'NOT_FOUND';
     soundBad(); flash('bad');
-    setStatus('bad', '❌ ' + code, 'Not found in today\'s file — set aside');
+    setStatus('bad', '❌ ' + code, 'Not found in today\'s file');
+    openDecision('NOT_FOUND', code, null);              // Feature 1 / found-location
   } else if (expectedRoute !== ROUTE) {
     status = 'WRONG_ROUTE';
     soundBad(); flash('bad');
     setStatus('bad', '🚫 WRONG VAN — ' + code, 'Belongs to Route ' + expectedRoute);
+    openDecision('WRONG_ROUTE', code, expectedRoute);   // Feature 1
   } else if (scannedHere[code]) {
     status = 'DUPLICATE';
     soundDup(); flash('warn');
@@ -288,7 +369,74 @@ function handleCode(code) {
   }
 
   addRecent(code, status);
+  // Audit log of every raw scan is preserved exactly as before.
   queueScan({ scanner: NAME, route: ROUTE, code: code, status: status, expectedRoute: expectedRoute || '' });
+}
+
+// ---------- Decision modal: out-of-route / not-found (Feature 1 + location capture) ----------
+function openDecision(kind, code, belongsToRoute) {
+  paused = true;
+  pending = { kind: kind, code: code, belongsToRoute: belongsToRoute || 'UNKNOWN' };
+  var actions = document.getElementById('decision-actions');
+  document.getElementById('found-loc').style.display = 'none';
+  actions.style.display = 'block';
+
+  if (kind === 'WRONG_ROUTE') {
+    document.getElementById('decision-title').innerHTML = '🚫 ' + code;
+    document.getElementById('decision-sub').textContent =
+      'Belongs to Route ' + belongsToRoute + ' — you are on Route ' + ROUTE + '.';
+    actions.innerHTML =
+      '<button class="btn" onclick="chooseMoved()">✅ I moved it to Route ' + belongsToRoute + '\'s lane</button>' +
+      '<button class="btn secondary" style="margin-top:8px" onclick="chooseAddFound()">📍 Left it here — add to Found list</button>' +
+      '<button class="btn secondary" style="margin-top:8px" onclick="closeDecision()">Skip</button>';
+  } else { // NOT_FOUND
+    document.getElementById('decision-title').innerHTML = '❌ ' + code;
+    document.getElementById('decision-sub').textContent = 'Not in today\'s file — where are you putting it?';
+    actions.innerHTML =
+      '<button class="btn secondary" onclick="chooseAddFound()">📍 Set aside — add to Found list</button>' +
+      '<button class="btn secondary" style="margin-top:8px" onclick="closeDecision()">Skip</button>';
+  }
+  document.getElementById('decision').style.display = 'flex';
+}
+
+// "I moved it to the correct lane" -> count the box as PRESENT on its correct route.
+function chooseMoved() {
+  var p = pending;
+  queueScan({ scanner: NAME, route: p.belongsToRoute, code: p.code, status: 'OK', expectedRoute: p.belongsToRoute });
+  api('resolveFound', { code: p.code, scanner: NAME }).catch(function () {}); // clear it from Found if it was there
+  soundGood();
+  addRecent(p.code, 'MOVED');
+  closeDecision();
+  setStatus('good', '➡️ ' + p.code + ' moved', 'Now counted on Route ' + p.belongsToRoute);
+}
+
+// Show the "where is it?" input.
+function chooseAddFound() {
+  document.getElementById('decision-actions').style.display = 'none';
+  document.getElementById('found-loc').style.display = 'block';
+  document.getElementById('loc-input').focus();
+}
+
+// Save the box + its physical location to the shared Found list.
+function saveFound() {
+  var p = pending;
+  var loc = document.getElementById('loc-input').value.trim();
+  document.getElementById('loc-input').value = '';
+  api('logFound', {
+    code: p.code, belongsToRoute: p.belongsToRoute, location: loc,
+    scanner: NAME, scannedUnderRoute: ROUTE
+  }).then(function () {
+    setStatus('warn', '📍 ' + p.code + ' in Found list', loc || 'location not specified');
+  }).catch(function (e) {
+    setStatus('bad', 'Couldn\'t save to Found list', e.message);
+  });
+  addRecent(p.code, 'FOUND');
+  closeDecision();
+}
+
+function closeDecision() {
+  document.getElementById('decision').style.display = 'none';
+  paused = false; pending = null; lastCode = ''; lastTime = 0;
 }
 
 // ---------- Scan upload with retry (handles brief signal drops) ----------
@@ -315,13 +463,13 @@ function uploadNext() {
 uploadNext(); // flush anything left over from a previous session
 
 function addRecent(code, status) {
-  var icon = { OK: '✅', WRONG_ROUTE: '🚫', NOT_FOUND: '❌', DUPLICATE: '↩' }[status];
+  var icon = { OK: '✅', WRONG_ROUTE: '🚫', NOT_FOUND: '❌', DUPLICATE: '↩', MOVED: '➡️', FOUND: '📍' }[status] || '•';
   var box = document.getElementById('recent');
   box.insertAdjacentHTML('afterbegin', '<div>' + icon + ' ' + code + '</div>');
   while (box.children.length > 6) box.removeChild(box.lastChild);
 }
 
-// ---------- 4: Confirm route ----------
+// ---------- 5: Done scanning -> success only here (Feature 2) + missing w/ found cross-ref (Feature 3) ----------
 function confirmRoute() {
   if (pendingScans.length > 0) {
     alert(pendingScans.length + ' scan(s) still uploading — wait a few seconds and try again.');
@@ -330,7 +478,16 @@ function confirmRoute() {
   }
   show('scr-result');
   document.getElementById('result-body').innerHTML = '<div class="loader">Checking scans from all phones…</div>';
-  api('confirmRoute', { route: ROUTE, scanner: NAME }).then(function (res) {
+
+  Promise.all([
+    api('confirmRoute', { route: ROUTE, scanner: NAME }),
+    api('getFoundList', {}).catch(function () { return { found: [] }; })
+  ]).then(function (arr) {
+    var res = arr[0];
+    var found = (arr[1] && arr[1].found) || [];
+    var foundByCode = {};
+    found.forEach(function (f) { if (!foundByCode[f.code]) foundByCode[f.code] = f; }); // newest wins (list is newest-first)
+
     var html;
     if (res.missing.length === 0) {
       soundGood();
@@ -341,7 +498,15 @@ function confirmRoute() {
       html = '<div class="missing-list"><b style="color:var(--red)">⚠️ ' + res.missing.length +
              ' box(es) missing on Route ' + res.route + ' (' + res.scannedCount + '/' + res.total + ' scanned):</b><ul>';
       res.missing.forEach(function (m) {
-        html += '<li><b>' + m.code + '</b>' + (m.stop ? ' — ' + m.stop : '') + '</li>';
+        html += '<li><b>' + m.code + '</b>' + (m.stop ? ' — ' + m.stop : '');
+        var f = foundByCode[m.code];
+        if (f) {
+          // Feature 3: this "missing" box was actually found on another lane.
+          var where = f.location ? f.location : 'location not noted';
+          var seen = f.scannedUnderRoute ? ' (seen on Route ' + f.scannedUnderRoute + ')' : '';
+          html += '<span class="hint">🔎 In Found list — at ' + where + seen + '</span>';
+        }
+        html += '</li>';
       });
       html += '</ul></div>';
     }
@@ -357,6 +522,63 @@ function switchRoute() {
   show('scr-route');
   loadRoutes(); // refresh in case sheet changed
 }
+
+// ---------- 6: Missing-boxes mode: the Found list ----------
+function loadFound() {
+  document.getElementById('found-body').innerHTML = '<div class="loader">Loading Found list…</div>';
+  api('getFoundList', {}).then(function (data) {
+    FOUND = (data && data.found) || [];
+    renderFound();
+  }).catch(function (e) {
+    document.getElementById('found-body').innerHTML =
+      '<p style="color:var(--red)">Error: ' + e.message +
+      '</p><button class="btn secondary" style="margin-top:12px" onclick="loadFound()">Retry</button>';
+  });
+}
+
+function renderFound() {
+  var q = document.getElementById('found-search').value.trim().toUpperCase();
+  var list = FOUND.filter(function (f) {
+    if (!q) return true;
+    return (f.code && f.code.toUpperCase().indexOf(q) >= 0) ||
+           (f.belongsToRoute && String(f.belongsToRoute).toUpperCase().indexOf(q) >= 0);
+  });
+  // Unresolved first, then resolved.
+  list.sort(function (a, b) { return (a.resolved === b.resolved) ? 0 : (a.resolved ? 1 : -1); });
+
+  if (list.length === 0) {
+    document.getElementById('found-body').innerHTML =
+      '<div class="empty">No found boxes right now. 🎉</div>';
+    return;
+  }
+
+  var html = '';
+  list.forEach(function (f) {
+    html += '<div class="found-card' + (f.resolved ? ' resolved' : '') + '">' +
+            '<div class="fc-code">' + f.code +
+            (f.resolved ? '<span class="badge done">collected</span>'
+                        : '<span class="badge">to collect</span>') + '</div>' +
+            '<div class="fc-meta">Belongs to Route <b>' + f.belongsToRoute + '</b>' +
+            (f.scannedUnderRoute ? ' · seen on Route ' + f.scannedUnderRoute : '') + '</div>' +
+            '<div class="fc-loc">📍 ' + (f.location || 'location not noted') + '</div>' +
+            (f.scanner ? '<div class="fc-meta">by ' + f.scanner + '</div>' : '') +
+            (f.resolved ? '' :
+              '<button class="btn" onclick="markCollected(\'' + jsEsc(f.code) + '\')">✅ Mark collected</button>') +
+            '</div>';
+  });
+  document.getElementById('found-body').innerHTML = html;
+}
+
+function markCollected(code) {
+  api('resolveFound', { code: code, scanner: NAME }).then(function () {
+    // reflect immediately, then refresh from server
+    FOUND.forEach(function (f) { if (f.code === code) f.resolved = true; });
+    renderFound();
+    loadFound();
+  }).catch(function (e) { alert('Could not mark collected: ' + e.message); });
+}
+
+function jsEsc(s) { return String(s).replace(/\\/g, '\\\\').replace(/'/g, "\\'"); }
 
 if (NAME) document.getElementById('who').textContent = NAME;
 </script>
